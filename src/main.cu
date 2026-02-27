@@ -792,40 +792,28 @@ int runTrain(int argc, char** argv) {
         for (int i = 0; i < numPos; ++i) {
             posScores[static_cast<size_t>(i)] = strongScores[static_cast<size_t>(i)];
         }
-        std::sort(posScores.begin(), posScores.end());
-
         const int minPass = std::max(1, static_cast<int>(std::ceil(minHitRate * static_cast<float>(numPos))));
-        float threshold = posScores.front();
+        const int cutIdx = numPos - minPass;
+        auto cutIt = posScores.begin() + cutIdx;
+        std::nth_element(posScores.begin(), cutIt, posScores.end());
+        const float cutVal = *cutIt;
 
-        // Pick the strictest threshold that still preserves required positive pass rate.
-        int i = numPos - 1;
-        while (i >= 0) {
-            const float v = posScores[static_cast<size_t>(i)];
-            int j = i;
-            while (j - 1 >= 0 && posScores[static_cast<size_t>(j - 1)] == v) {
-                --j;
-            }
-
-            const int passGe = numPos - j;       // score >= v
-            const int passGt = numPos - (i + 1); // score > v
-
-            if (passGt >= minPass) {
-                threshold = std::nextafter(v, std::numeric_limits<float>::infinity());
-                break;
-            }
-            if (passGe >= minPass) {
-                threshold = v;
-                break;
-            }
-            i = j - 1;
-        }
-
-        int posPass = 0;
-        for (int k = 0; k < numPos; ++k) {
-            if (strongScores[static_cast<size_t>(k)] >= threshold) {
-                ++posPass;
+        int passGe = 0;
+        int passGt = 0;
+        for (int i = 0; i < numPos; ++i) {
+            const float s = strongScores[static_cast<size_t>(i)];
+            if (s > cutVal) {
+                ++passGt;
+                ++passGe;
+            } else if (s == cutVal) {
+                ++passGe;
             }
         }
+
+        const float threshold = (passGt >= minPass)
+                                    ? std::nextafter(cutVal, std::numeric_limits<float>::infinity())
+                                    : cutVal;
+        const int posPass = (passGt >= minPass) ? passGt : passGe;
         outThreshold = threshold;
         outHitRate = static_cast<float>(posPass) / static_cast<float>(numPos);
     };
@@ -1282,7 +1270,12 @@ int runTrain(int argc, char** argv) {
                     posSum += s;
                 }
                 const float posMean = static_cast<float>(posSum / static_cast<double>(numPos));
-                const float posMedian = posScores.empty() ? 0.0f : posScores[posScores.size() / 2];
+                float posMedian = 0.0f;
+                if (!posScores.empty()) {
+                    auto midIt = posScores.begin() + (posScores.size() / 2);
+                    std::nth_element(posScores.begin(), midIt, posScores.end());
+                    posMedian = *midIt;
+                }
 
                 float negMin = std::numeric_limits<float>::infinity();
                 float negMax = -std::numeric_limits<float>::infinity();

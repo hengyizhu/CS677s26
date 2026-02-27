@@ -1076,41 +1076,53 @@ Status FaceVisionEngine::setCascadeModel(const HaarFeature* dUsedFeatures,
         clearCascadeModel(stream);
         return fromCuda(st);
     }
-    for (int r = 0; r < kLutRects; ++r) {
-        for (int c = 0; c < kLutCorners; ++c) {
-            st = ensureAlloc(reinterpret_cast<void**>(&dLutDx_[r][c]),
-                             usedFeatureCount,
-                             modelLutCapacity_,
-                             sizeof(int32_t));
-            if (st != cudaSuccess) {
-                clearCascadeModel(stream);
-                return fromCuda(st);
+    if (modelLutCapacity_ < usedFeatureCount) {
+        for (int r = 0; r < kLutRects; ++r) {
+            for (int c = 0; c < kLutCorners; ++c) {
+                if (dLutDx_[r][c]) {
+                    cudaFree(dLutDx_[r][c]);
+                    dLutDx_[r][c] = nullptr;
+                }
+                if (dLutDy_[r][c]) {
+                    cudaFree(dLutDy_[r][c]);
+                    dLutDy_[r][c] = nullptr;
+                }
             }
-            st = ensureAlloc(reinterpret_cast<void**>(&dLutDy_[r][c]),
-                             usedFeatureCount,
-                             modelLutCapacity_,
-                             sizeof(int32_t));
+            if (dLutW_[r]) {
+                cudaFree(dLutW_[r]);
+                dLutW_[r] = nullptr;
+            }
+        }
+        if (dLutRectCount_) {
+            cudaFree(dLutRectCount_);
+            dLutRectCount_ = nullptr;
+        }
+
+        for (int r = 0; r < kLutRects; ++r) {
+            for (int c = 0; c < kLutCorners; ++c) {
+                st = cudaMalloc(&dLutDx_[r][c], static_cast<size_t>(usedFeatureCount) * sizeof(int32_t));
+                if (st != cudaSuccess) {
+                    clearCascadeModel(stream);
+                    return fromCuda(st);
+                }
+                st = cudaMalloc(&dLutDy_[r][c], static_cast<size_t>(usedFeatureCount) * sizeof(int32_t));
+                if (st != cudaSuccess) {
+                    clearCascadeModel(stream);
+                    return fromCuda(st);
+                }
+            }
+            st = cudaMalloc(&dLutW_[r], static_cast<size_t>(usedFeatureCount) * sizeof(float));
             if (st != cudaSuccess) {
                 clearCascadeModel(stream);
                 return fromCuda(st);
             }
         }
-        st = ensureAlloc(reinterpret_cast<void**>(&dLutW_[r]),
-                         usedFeatureCount,
-                         modelLutCapacity_,
-                         sizeof(float));
+        st = cudaMalloc(&dLutRectCount_, static_cast<size_t>(usedFeatureCount) * sizeof(uint8_t));
         if (st != cudaSuccess) {
             clearCascadeModel(stream);
             return fromCuda(st);
         }
-    }
-    st = ensureAlloc(reinterpret_cast<void**>(&dLutRectCount_),
-                     usedFeatureCount,
-                     modelLutCapacity_,
-                     sizeof(uint8_t));
-    if (st != cudaSuccess) {
-        clearCascadeModel(stream);
-        return fromCuda(st);
+        modelLutCapacity_ = usedFeatureCount;
     }
 
     st = cudaMemcpyAsync(dModelFeatures_, dUsedFeatures,
