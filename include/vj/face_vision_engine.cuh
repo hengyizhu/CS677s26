@@ -40,6 +40,7 @@ public:
                                           int imageH,
                                           int imageStride,
                                           int nSamples,
+                                          bool computeInvNorm = true,
                                           cudaStream_t stream = nullptr);
 
     IntegralImageSetT integralSetView() const noexcept;

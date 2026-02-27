@@ -928,6 +928,7 @@ Status FaceVisionEngine::computeIntegralBatchTransposed(const uint8_t* dGrayBatc
                                                         int imageH,
                                                         int imageStride,
                                                         int nSamples,
+                                                        bool computeInvNorm,
                                                         cudaStream_t stream) {
     if (!dGrayBatch || imageW <= 0 || imageH <= 0 || imageStride < imageW || nSamples <= 0) {
         return Status::kInvalidArg;
@@ -992,7 +993,7 @@ Status FaceVisionEngine::computeIntegralBatchTransposed(const uint8_t* dGrayBatc
         }
     }
 
-    {
+    if (computeInvNorm) {
         const int iiWidth = imageW + 1;
         const int iiHeight = imageH + 1;
         const int normThreads = (nSamples < kNormThreads) ? nSamples : kNormThreads;
@@ -1450,7 +1451,7 @@ Status FaceVisionEngine::detectMultiScale(const uint8_t* dImageGray,
             prevStride = scaledStride;
         }
 
-        Status s = computeIntegralBatchTransposed(dScaled, scaledW, scaledH, scaledStride, 1, stream);
+        Status s = computeIntegralBatchTransposed(dScaled, scaledW, scaledH, scaledStride, 1, false, stream);
         if (s != Status::kOk) {
             return s;
         }
