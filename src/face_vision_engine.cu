@@ -1458,8 +1458,8 @@ Status FaceVisionEngine::detectMultiScale(const uint8_t* dImageGray,
 
         const int workW = scaledW - win_.winW + 1;
         const int workH = scaledH - win_.winH + 1;
-        // Scale-aware jump scanning: skip more positions at large scales.
-        const int step = (scale >= 2.0f) ? 2 : 1;
+        // Scale-aware jump scanning: progressively skip more positions at large scales.
+        const int step = (scale >= 3.0f) ? 3 : ((scale >= 2.0f) ? 2 : 1);
         const int scanW = divUpHost(workW, step);
         const int scanH = divUpHost(workH, step);
 
