@@ -2,6 +2,7 @@
 #include <cub/cub.cuh>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -383,6 +384,49 @@ __global__ void AccumulateStrongScoreKernel(const float* __restrict__ resp,
     strong[i] += (resp[i] < theta) ? leftVal : rightVal;
 }
 
+__global__ void ExtractPosScoresKernel(const float* __restrict__ strong,
+                                       float* __restrict__ posScores,
+                                       int numPos) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < numPos) {
+        posScores[i] = strong[i];
+    }
+}
+
+__global__ void CountPassAndNegKernel(const float* __restrict__ strong,
+                                      const uint8_t* __restrict__ active,
+                                      int nSamples,
+                                      int numPos,
+                                      float cutVal,
+                                      unsigned int* __restrict__ counts4) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= nSamples) return;
+
+    const float s = strong[i];
+    const bool ge = (s >= cutVal);
+    const bool gt = (s > cutVal);
+
+    if (i < numPos) {
+        if (ge) atomicAdd(&counts4[0], 1u);  // posGe
+        if (gt) atomicAdd(&counts4[1], 1u);  // posGt
+    } else if (!active || active[i] != 0) {
+        if (ge) atomicAdd(&counts4[2], 1u);  // negGe
+        if (gt) atomicAdd(&counts4[3], 1u);  // negGt
+    }
+}
+
+__global__ void UpdateActiveNegByThresholdKernel(const float* __restrict__ strong,
+                                                 uint8_t* __restrict__ active,
+                                                 int nSamples,
+                                                 int numPos,
+                                                 float threshold) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= nSamples || i < numPos) return;
+    if (active[i] != 0) {
+        active[i] = (strong[i] >= threshold) ? 1 : 0;
+    }
+}
+
 __global__ void FillArrayKernel(float* __restrict__ arr, int n, float v) {
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i < n) arr[i] = v;
@@ -729,10 +773,26 @@ int runTrain(int argc, char** argv) {
     CudaBuffer<TileBestCandidate> dRoundBest(1);
     CudaBuffer<float> dStrong(static_cast<size_t>(nSamples));
     CudaBuffer<uint8_t> dUsedFeatureMask(static_cast<size_t>(numFeatures));
+    CudaBuffer<float> dPosScoreIn(static_cast<size_t>(numPos));
+    CudaBuffer<float> dPosScoreOut(static_cast<size_t>(numPos));
+    CudaBuffer<unsigned int> dRoundCounts(4);
     std::vector<float> hStrong(static_cast<size_t>(nSamples), 0.0f);
     std::vector<float> posScores(static_cast<size_t>(numPos), 0.0f);
     std::vector<float> hWeightsDbg;
     std::vector<float> hRespDbg;
+    std::array<unsigned int, 4> hRoundCounts{{0u, 0u, 0u, 0u}};
+    float hCutVal = 0.0f;
+
+    size_t posSortBytes = 0;
+    if (cub::DeviceRadixSort::SortKeys(nullptr,
+                                       posSortBytes,
+                                       dPosScoreIn.data(),
+                                       dPosScoreOut.data(),
+                                       numPos) != cudaSuccess) {
+        std::cerr << "[ERR] query positive-score sort temp bytes failed\n";
+        return 1;
+    }
+    CudaBuffer<uint8_t> dPosSortTemp(posSortBytes);
 
     int debugEvery = 0;
     if (const char* dbgEnv = std::getenv("VJ_DEBUG_EVERY")) {
@@ -784,38 +844,6 @@ int runTrain(int argc, char** argv) {
         return cudaMemcpy(dWeight.data(), hWeights.data(),
                           static_cast<size_t>(nSamples) * sizeof(float),
                           cudaMemcpyHostToDevice) == cudaSuccess;
-    };
-
-    auto calibrateStageThreshold = [&](const std::vector<float>& strongScores,
-                                       float& outThreshold,
-                                       float& outHitRate) {
-        for (int i = 0; i < numPos; ++i) {
-            posScores[static_cast<size_t>(i)] = strongScores[static_cast<size_t>(i)];
-        }
-        const int minPass = std::max(1, static_cast<int>(std::ceil(minHitRate * static_cast<float>(numPos))));
-        const int cutIdx = numPos - minPass;
-        auto cutIt = posScores.begin() + cutIdx;
-        std::nth_element(posScores.begin(), cutIt, posScores.end());
-        const float cutVal = *cutIt;
-
-        int passGe = 0;
-        int passGt = 0;
-        for (int i = 0; i < numPos; ++i) {
-            const float s = strongScores[static_cast<size_t>(i)];
-            if (s > cutVal) {
-                ++passGt;
-                ++passGe;
-            } else if (s == cutVal) {
-                ++passGe;
-            }
-        }
-
-        const float threshold = (passGt >= minPass)
-                                    ? std::nextafter(cutVal, std::numeric_limits<float>::infinity())
-                                    : cutVal;
-        const int posPass = (passGt >= minPass) ? passGt : passGe;
-        outThreshold = threshold;
-        outHitRate = static_cast<float>(posPass) / static_cast<float>(numPos);
     };
 
     cudaDeviceSynchronize();
@@ -1239,27 +1267,71 @@ int runTrain(int argc, char** argv) {
                 return 1;
             }
 
-            if (cudaMemcpy(hStrong.data(),
-                           dStrong.data(),
-                           static_cast<size_t>(nSamples) * sizeof(float),
+            // GPU-side threshold calibration:
+            // 1) sort positive strong scores, take cut value.
+            // 2) count pass/neg-survive for both >=cut and >cut in one kernel.
+            const int cutIdx = numPos - std::max(1, static_cast<int>(std::ceil(minHitRate * static_cast<float>(numPos))));
+            const dim3 posGrid(static_cast<unsigned>((numPos + 255) / 256), 1, 1);
+            ExtractPosScoresKernel<<<posGrid, blk>>>(dStrong.data(), dPosScoreIn.data(), numPos);
+            if (cudaGetLastError() != cudaSuccess) {
+                std::cerr << "[ERR] ExtractPosScoresKernel launch failed\n";
+                return 1;
+            }
+            if (cub::DeviceRadixSort::SortKeys(dPosSortTemp.data(),
+                                               posSortBytes,
+                                               dPosScoreIn.data(),
+                                               dPosScoreOut.data(),
+                                               numPos) != cudaSuccess) {
+                std::cerr << "[ERR] positive-score sort failed\n";
+                return 1;
+            }
+            if (cudaMemcpy(&hCutVal,
+                           dPosScoreOut.data() + cutIdx,
+                           sizeof(float),
                            cudaMemcpyDeviceToHost) != cudaSuccess) {
-                std::cerr << "[ERR] copy strong scores failed\n";
+                std::cerr << "[ERR] copy positive cut value failed\n";
                 return 1;
             }
 
-            float hitRate = 0.0f;
-            calibrateStageThreshold(hStrong, stageThreshold, hitRate);
-
-            int negSurvive = 0;
-            for (int idx : incomingNegIdx) {
-                if (hStrong[static_cast<size_t>(idx)] >= stageThreshold) {
-                    ++negSurvive;
-                }
+            if (cudaMemset(dRoundCounts.data(), 0, 4 * sizeof(unsigned int)) != cudaSuccess) {
+                std::cerr << "[ERR] clear round counts failed\n";
+                return 1;
             }
+            CountPassAndNegKernel<<<grd, blk>>>(dStrong.data(),
+                                                dActive.data(),
+                                                nSamples,
+                                                numPos,
+                                                hCutVal,
+                                                dRoundCounts.data());
+            if (cudaGetLastError() != cudaSuccess) {
+                std::cerr << "[ERR] CountPassAndNegKernel launch failed\n";
+                return 1;
+            }
+            if (cudaMemcpy(hRoundCounts.data(),
+                           dRoundCounts.data(),
+                           4 * sizeof(unsigned int),
+                           cudaMemcpyDeviceToHost) != cudaSuccess) {
+                std::cerr << "[ERR] copy round counts failed\n";
+                return 1;
+            }
+
+            const int minPass = std::max(1, static_cast<int>(std::ceil(minHitRate * static_cast<float>(numPos))));
+            const bool strictGt = static_cast<int>(hRoundCounts[1]) >= minPass;
+            stageThreshold = strictGt ? std::nextafter(hCutVal, std::numeric_limits<float>::infinity()) : hCutVal;
+            const int posPass = strictGt ? static_cast<int>(hRoundCounts[1]) : static_cast<int>(hRoundCounts[0]);
+            const int negSurvive = strictGt ? static_cast<int>(hRoundCounts[3]) : static_cast<int>(hRoundCounts[2]);
+            const float hitRate = static_cast<float>(posPass) / static_cast<float>(numPos);
 
             const float falseAlarm = static_cast<float>(negSurvive) / static_cast<float>(stageNegBaseCount);
 
             if (emitDebug) {
+                if (cudaMemcpy(hStrong.data(),
+                               dStrong.data(),
+                               static_cast<size_t>(nSamples) * sizeof(float),
+                               cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    std::cerr << "[ERR] copy strong scores for debug failed\n";
+                    return 1;
+                }
                 float posMin = std::numeric_limits<float>::infinity();
                 float posMax = -std::numeric_limits<float>::infinity();
                 double posSum = 0.0;
@@ -1333,22 +1405,20 @@ int runTrain(int argc, char** argv) {
             break;
         }
 
-        // Apply stage rejection once after stage threshold is finalized.
-        if (cudaMemcpy(hStrong.data(),
-                       dStrong.data(),
-                       static_cast<size_t>(nSamples) * sizeof(float),
-                       cudaMemcpyDeviceToHost) != cudaSuccess) {
-            std::cerr << "[ERR] copy final strong scores failed\n";
+        // Apply stage rejection on GPU once after stage threshold is finalized.
+        UpdateActiveNegByThresholdKernel<<<grd, blk>>>(dStrong.data(),
+                                                       dActive.data(),
+                                                       nSamples,
+                                                       numPos,
+                                                       stageThreshold);
+        if (cudaGetLastError() != cudaSuccess) {
+            std::cerr << "[ERR] UpdateActiveNegByThresholdKernel launch failed\n";
             return 1;
         }
-        for (int idx : incomingNegIdx) {
-            hActive[static_cast<size_t>(idx)] =
-                (hStrong[static_cast<size_t>(idx)] >= stageThreshold) ? 1 : 0;
-        }
-        if (cudaMemcpy(dActive.data(), hActive.data(),
+        if (cudaMemcpy(hActive.data(), dActive.data(),
                        static_cast<size_t>(nSamples) * sizeof(uint8_t),
-                       cudaMemcpyHostToDevice) != cudaSuccess) {
-            std::cerr << "[ERR] copy stage active mask failed\n";
+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+            std::cerr << "[ERR] copy stage active mask to host failed\n";
             return 1;
         }
 
