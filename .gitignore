@@ -1,3 +1,5 @@
+cascadedetect/
+traincascade/
 logs/
 build/
 .venv/
