@@ -101,10 +101,14 @@ private:
     float* dLutW_[kLutRects] = {};
     uint8_t* dLutRectCount_ = nullptr;
     int modelFeatureCount_ = 0;
+    int modelFeatureCapacity_ = 0;
+    int modelLutCapacity_ = 0;
     GpuStump4* dModelStumps_ = nullptr;
     int modelStumpCount_ = 0;
+    int modelStumpCapacity_ = 0;
     CascadeStage* dModelStages_ = nullptr;
     int modelStageCount_ = 0;
+    int modelStageCapacity_ = 0;
 
     Detection* dDetectOut_ = nullptr;
     int* dDetectCount_ = nullptr;

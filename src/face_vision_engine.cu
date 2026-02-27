@@ -141,6 +141,34 @@ __global__ void ColumnScanTransposeKernel(const int32_t* __restrict__ d_rowPrefi
     }
 }
 
+__global__ void ColumnScanTransposeSingleSampleKernel(const int32_t* __restrict__ d_rowPrefix,
+                                                      const int32_t* __restrict__ d_rowPrefixSq,
+                                                      int imageW,
+                                                      int imageH,
+                                                      int rowStride,
+                                                      int32_t* __restrict__ d_sumT,
+                                                      int32_t* __restrict__ d_sqsumT) {
+    const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (x > imageW) {
+        return;
+    }
+
+    int64_t colSum = 0;
+    int64_t colSqSum = 0;
+
+    d_sumT[x] = 0;
+    d_sqsumT[x] = 0;
+
+    for (int y = 1; y <= imageH; ++y) {
+        const size_t rowIdx = static_cast<size_t>(y - 1) * rowStride + x;
+        colSum += d_rowPrefix[rowIdx];
+        colSqSum += d_rowPrefixSq[rowIdx];
+        const size_t p = static_cast<size_t>(y) * (imageW + 1) + x;
+        d_sumT[p] = static_cast<int32_t>(colSum);
+        d_sqsumT[p] = static_cast<int32_t>(colSqSum);
+    }
+}
+
 __global__ void ComputeInvNormKernel(const int32_t* __restrict__ d_sumT,
                                      const int32_t* __restrict__ d_sqsumT,
                                      int nSamples,
@@ -330,14 +358,11 @@ __global__ __launch_bounds__(256, 2) void DetectCascadeKernel(const int32_t* __r
                                                                int maxOut) {
     const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) * step;
     const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y) * step;
+    const int tid = static_cast<int>(threadIdx.y * blockDim.x + threadIdx.x);
 
     const int workW = iiWidth - 1 - winW + 1;
     const int workH = iiHeight - 1 - winH + 1;
-
-    if (x >= workW || y >= workH) {
-        return;
-    }
-
+    const bool inRange = (x < workW && y < workH);
     const int base = y * iiWidth + x;
 
     const int nx = 1;
@@ -357,83 +382,103 @@ __global__ __launch_bounds__(256, 2) void DetectCascadeKernel(const int32_t* __r
         return static_cast<uint32_t>(ldgRead(d_sqsumT + p));
     };
 
-    const double normSum = static_cast<double>(readII(base + np0) - readII(base + np1) - readII(base + np2) + readII(base + np3));
-    const uint32_t normSqU =
-        readSqU32(base + np0) - readSqU32(base + np1) - readSqU32(base + np2) + readSqU32(base + np3);
-    const double normSq = static_cast<double>(normSqU);
-    const double nf2 = static_cast<double>(narea) * normSq - normSum * normSum;
-    if (nf2 <= 0.0) {
-        return;
-    }
-    const float invNorm = static_cast<float>(1.0 / sqrt(nf2));
-    // Match OpenCV HaarEvaluator::setWindow gate for low-texture windows.
-    if (static_cast<double>(narea) * static_cast<double>(invNorm) >= 1e-1) {
-        return;
-    }
-
+    bool pass = false;
     float lastStageScore = 0.0f;
+    if (inRange) {
+        const double normSum = static_cast<double>(readII(base + np0) - readII(base + np1) - readII(base + np2) + readII(base + np3));
+        const uint32_t normSqU =
+            readSqU32(base + np0) - readSqU32(base + np1) - readSqU32(base + np2) + readSqU32(base + np3);
+        const double normSq = static_cast<double>(normSqU);
+        const double nf2 = static_cast<double>(narea) * normSq - normSum * normSum;
+        if (nf2 > 0.0) {
+            const float invNorm = static_cast<float>(1.0 / sqrt(nf2));
+            // Match OpenCV HaarEvaluator::setWindow gate for low-texture windows.
+            if (static_cast<double>(narea) * static_cast<double>(invNorm) < 1e-1) {
+                pass = true;
+                // Cascade early rejection: once one stage fails, this window is rejected.
+                for (int si = 0; si < stageCount; ++si) {
+                    const CascadeStage st = d_stages[si];
+                    float stageSum = 0.0f;
 
-    // Cascade early rejection: once one stage fails, thread exits immediately.
-    for (int si = 0; si < stageCount; ++si) {
-        const CascadeStage st = d_stages[si];
-        float stageSum = 0.0f;
+                    for (int wi = 0; wi < st.ntrees; ++wi) {
+                        const float4 s = ldgRead(&(d_stumps[st.first + wi].st));
+                        const int featureIdx = __float_as_int(s.x);
+                        const float theta = s.y;
+                        const float leftVal = s.z;
+                        const float rightVal = s.w;
 
-        for (int wi = 0; wi < st.ntrees; ++wi) {
-            const float4 s = ldgRead(&(d_stumps[st.first + wi].st));
-            const int featureIdx = __float_as_int(s.x);
-            const float theta = s.y;
-            const float leftVal = s.z;
-            const float rightVal = s.w;
+                        const int r0p0 = ldgRead(dR0Dy0 + featureIdx) * iiWidth + ldgRead(dR0Dx0 + featureIdx);
+                        const int r0p1 = ldgRead(dR0Dy1 + featureIdx) * iiWidth + ldgRead(dR0Dx1 + featureIdx);
+                        const int r0p2 = ldgRead(dR0Dy2 + featureIdx) * iiWidth + ldgRead(dR0Dx2 + featureIdx);
+                        const int r0p3 = ldgRead(dR0Dy3 + featureIdx) * iiWidth + ldgRead(dR0Dx3 + featureIdx);
+                        const int r1p0 = ldgRead(dR1Dy0 + featureIdx) * iiWidth + ldgRead(dR1Dx0 + featureIdx);
+                        const int r1p1 = ldgRead(dR1Dy1 + featureIdx) * iiWidth + ldgRead(dR1Dx1 + featureIdx);
+                        const int r1p2 = ldgRead(dR1Dy2 + featureIdx) * iiWidth + ldgRead(dR1Dx2 + featureIdx);
+                        const int r1p3 = ldgRead(dR1Dy3 + featureIdx) * iiWidth + ldgRead(dR1Dx3 + featureIdx);
 
-            const int r0p0 = ldgRead(dR0Dy0 + featureIdx) * iiWidth + ldgRead(dR0Dx0 + featureIdx);
-            const int r0p1 = ldgRead(dR0Dy1 + featureIdx) * iiWidth + ldgRead(dR0Dx1 + featureIdx);
-            const int r0p2 = ldgRead(dR0Dy2 + featureIdx) * iiWidth + ldgRead(dR0Dx2 + featureIdx);
-            const int r0p3 = ldgRead(dR0Dy3 + featureIdx) * iiWidth + ldgRead(dR0Dx3 + featureIdx);
-            const int r1p0 = ldgRead(dR1Dy0 + featureIdx) * iiWidth + ldgRead(dR1Dx0 + featureIdx);
-            const int r1p1 = ldgRead(dR1Dy1 + featureIdx) * iiWidth + ldgRead(dR1Dx1 + featureIdx);
-            const int r1p2 = ldgRead(dR1Dy2 + featureIdx) * iiWidth + ldgRead(dR1Dx2 + featureIdx);
-            const int r1p3 = ldgRead(dR1Dy3 + featureIdx) * iiWidth + ldgRead(dR1Dx3 + featureIdx);
+                        const float r0w = ldgRead(dR0W + featureIdx);
+                        const float r1w = ldgRead(dR1W + featureIdx);
 
-            const float r0w = ldgRead(dR0W + featureIdx);
-            const float r1w = ldgRead(dR1W + featureIdx);
+                        const float v0 = (readII(base + r0p0) - readII(base + r0p1) - readII(base + r0p2) + readII(base + r0p3)) * r0w;
+                        const float v1 = (readII(base + r1p0) - readII(base + r1p1) - readII(base + r1p2) + readII(base + r1p3)) * r1w;
 
-            const float v0 = (readII(base + r0p0) - readII(base + r0p1) - readII(base + r0p2) + readII(base + r0p3)) * r0w;
-            const float v1 = (readII(base + r1p0) - readII(base + r1p1) - readII(base + r1p2) + readII(base + r1p3)) * r1w;
+                        float raw = v0 + v1;
+                        if (ldgRead(dRectCount + featureIdx) == 3) {
+                            const int r2p0 = ldgRead(dR2Dy0 + featureIdx) * iiWidth + ldgRead(dR2Dx0 + featureIdx);
+                            const int r2p1 = ldgRead(dR2Dy1 + featureIdx) * iiWidth + ldgRead(dR2Dx1 + featureIdx);
+                            const int r2p2 = ldgRead(dR2Dy2 + featureIdx) * iiWidth + ldgRead(dR2Dx2 + featureIdx);
+                            const int r2p3 = ldgRead(dR2Dy3 + featureIdx) * iiWidth + ldgRead(dR2Dx3 + featureIdx);
+                            const float r2w = ldgRead(dR2W + featureIdx);
+                            const float v2 = (readII(base + r2p0) - readII(base + r2p1) - readII(base + r2p2) + readII(base + r2p3)) * r2w;
+                            raw += v2;
+                        }
 
-            float raw = v0 + v1;
-            if (ldgRead(dRectCount + featureIdx) == 3) {
-                const int r2p0 = ldgRead(dR2Dy0 + featureIdx) * iiWidth + ldgRead(dR2Dx0 + featureIdx);
-                const int r2p1 = ldgRead(dR2Dy1 + featureIdx) * iiWidth + ldgRead(dR2Dx1 + featureIdx);
-                const int r2p2 = ldgRead(dR2Dy2 + featureIdx) * iiWidth + ldgRead(dR2Dx2 + featureIdx);
-                const int r2p3 = ldgRead(dR2Dy3 + featureIdx) * iiWidth + ldgRead(dR2Dx3 + featureIdx);
-                const float r2w = ldgRead(dR2W + featureIdx);
-                const float v2 = (readII(base + r2p0) - readII(base + r2p1) - readII(base + r2p2) + readII(base + r2p3)) * r2w;
-                raw += v2;
+                        // Keep decision numerically identical to training: compare normalized response.
+                        stageSum += (raw * invNorm < theta) ? leftVal : rightVal;
+                    }
+
+                    if (stageSum < st.threshold) {
+                        pass = false;
+                        break;
+                    }
+                    lastStageScore = stageSum;
+                }
             }
-
-            // Keep decision numerically identical to training: compare normalized response.
-            stageSum += (raw * invNorm < theta) ? leftVal : rightVal;
         }
-
-        if (stageSum < st.threshold) {
-            return;
-        }
-        lastStageScore = stageSum;
     }
 
-    const int outIdx = atomicAdd(d_count, 1);
-    if (outIdx >= maxOut) {
-        return;
+    __shared__ int sCount;
+    __shared__ int sBase;
+    if (tid == 0) {
+        sCount = 0;
+        sBase = 0;
     }
+    __syncthreads();
 
-    Detection det{};
-    det.x = static_cast<int>(x * scale + 0.5f);
-    det.y = static_cast<int>(y * scale + 0.5f);
-    det.w = static_cast<int>(winW * scale + 0.5f);
-    det.h = static_cast<int>(winH * scale + 0.5f);
-    det.scaleIdx = scaleIdx;
-    det.score = lastStageScore;
-    d_out[outIdx] = det;
+    int localRank = -1;
+    if (pass) {
+        localRank = atomicAdd(&sCount, 1);
+    }
+    __syncthreads();
+
+    if (tid == 0 && sCount > 0) {
+        sBase = atomicAdd(d_count, sCount);
+    }
+    __syncthreads();
+
+    if (pass) {
+        const int outIdx = sBase + localRank;
+        if (outIdx < maxOut) {
+            Detection det{};
+            det.x = static_cast<int>(x * scale + 0.5f);
+            det.y = static_cast<int>(y * scale + 0.5f);
+            det.w = static_cast<int>(winW * scale + 0.5f);
+            det.h = static_cast<int>(winH * scale + 0.5f);
+            det.scaleIdx = scaleIdx;
+            det.score = lastStageScore;
+            d_out[outIdx] = det;
+        }
+    }
 }
 
 inline float iou(const Detection& a, const Detection& b) {
@@ -667,10 +712,14 @@ FaceVisionEngine& FaceVisionEngine::operator=(FaceVisionEngine&& other) noexcept
     }
     dLutRectCount_ = other.dLutRectCount_;
     modelFeatureCount_ = other.modelFeatureCount_;
+    modelFeatureCapacity_ = other.modelFeatureCapacity_;
+    modelLutCapacity_ = other.modelLutCapacity_;
     dModelStumps_ = other.dModelStumps_;
     modelStumpCount_ = other.modelStumpCount_;
+    modelStumpCapacity_ = other.modelStumpCapacity_;
     dModelStages_ = other.dModelStages_;
     modelStageCount_ = other.modelStageCount_;
+    modelStageCapacity_ = other.modelStageCapacity_;
 
     dDetectOut_ = other.dDetectOut_;
     dDetectCount_ = other.dDetectCount_;
@@ -705,8 +754,12 @@ FaceVisionEngine& FaceVisionEngine::operator=(FaceVisionEngine&& other) noexcept
     other.currentImageW_ = 0;
     other.currentImageH_ = 0;
     other.modelFeatureCount_ = 0;
+    other.modelFeatureCapacity_ = 0;
+    other.modelLutCapacity_ = 0;
     other.modelStumpCount_ = 0;
+    other.modelStumpCapacity_ = 0;
     other.modelStageCount_ = 0;
+    other.modelStageCapacity_ = 0;
     return *this;
 }
 
@@ -906,18 +959,32 @@ Status FaceVisionEngine::computeIntegralBatchTransposed(const uint8_t* dGrayBatc
     }
 
     {
-        const dim3 block(128, 1, 1);
-        const dim3 grid(static_cast<unsigned>((nSamples + 128 - 1) / 128),
-                        static_cast<unsigned>(imageW + 1),
-                        1);
-        ColumnScanTransposeKernel<<<grid, block, 0, stream>>>(dRowPrefix_,
-                                                               dRowPrefixSq_,
-                                                               imageW,
-                                                               imageH,
-                                                               nSamples,
-                                                               rowStride,
-                                                               dSumT_,
-                                                               dSqsumT_);
+        if (nSamples == 1) {
+            const int colThreads = 256;
+            const dim3 block(static_cast<unsigned>(colThreads), 1, 1);
+            const dim3 grid(static_cast<unsigned>(divUpHost(imageW + 1, colThreads)), 1, 1);
+            ColumnScanTransposeSingleSampleKernel<<<grid, block, 0, stream>>>(dRowPrefix_,
+                                                                                dRowPrefixSq_,
+                                                                                imageW,
+                                                                                imageH,
+                                                                                rowStride,
+                                                                                dSumT_,
+                                                                                dSqsumT_);
+        } else {
+            const int colThreads = 128;
+            const dim3 block(static_cast<unsigned>(colThreads), 1, 1);
+            const dim3 grid(static_cast<unsigned>((nSamples + colThreads - 1) / colThreads),
+                            static_cast<unsigned>(imageW + 1),
+                            1);
+            ColumnScanTransposeKernel<<<grid, block, 0, stream>>>(dRowPrefix_,
+                                                                   dRowPrefixSq_,
+                                                                   imageW,
+                                                                   imageH,
+                                                                   nSamples,
+                                                                   rowStride,
+                                                                   dSumT_,
+                                                                   dSqsumT_);
+        }
         const cudaError_t st = cudaGetLastError();
         if (st != cudaSuccess) {
             return fromCuda(st);
@@ -927,8 +994,9 @@ Status FaceVisionEngine::computeIntegralBatchTransposed(const uint8_t* dGrayBatc
     {
         const int iiWidth = imageW + 1;
         const int iiHeight = imageH + 1;
-        const dim3 block(kNormThreads, 1, 1);
-        const dim3 grid(static_cast<unsigned>((nSamples + kNormThreads - 1) / kNormThreads), 1, 1);
+        const int normThreads = (nSamples < kNormThreads) ? nSamples : kNormThreads;
+        const dim3 block(static_cast<unsigned>(normThreads), 1, 1);
+        const dim3 grid(static_cast<unsigned>((nSamples + normThreads - 1) / normThreads), 1, 1);
         ComputeInvNormKernel<<<grid, block, 0, stream>>>(dSumT_, dSqsumT_, nSamples, iiWidth, iiHeight, dInvNorm_);
         const cudaError_t st = cudaGetLastError();
         if (st != cudaSuccess) {
@@ -962,43 +1030,84 @@ Status FaceVisionEngine::setCascadeModel(const HaarFeature* dUsedFeatures,
         return Status::kInvalidArg;
     }
 
-    clearCascadeModel(stream);
+    auto ensureAlloc = [&](void** ptr, int neededCount, int& capacityCount, size_t elemSize) -> cudaError_t {
+        if (neededCount <= 0) {
+            return cudaErrorInvalidValue;
+        }
+        if (*ptr && capacityCount >= neededCount) {
+            return cudaSuccess;
+        }
+        if (*ptr) {
+            const cudaError_t freeSt = cudaFree(*ptr);
+            if (freeSt != cudaSuccess) {
+                return freeSt;
+            }
+            *ptr = nullptr;
+            capacityCount = 0;
+        }
+        const cudaError_t allocSt = cudaMalloc(ptr, static_cast<size_t>(neededCount) * elemSize);
+        if (allocSt == cudaSuccess) {
+            capacityCount = neededCount;
+        }
+        return allocSt;
+    };
 
-    cudaError_t st = cudaMalloc(&dModelFeatures_, static_cast<size_t>(usedFeatureCount) * sizeof(HaarFeature));
+    cudaError_t st = ensureAlloc(reinterpret_cast<void**>(&dModelFeatures_),
+                                 usedFeatureCount,
+                                 modelFeatureCapacity_,
+                                 sizeof(HaarFeature));
     if (st != cudaSuccess) {
         clearCascadeModel(stream);
         return fromCuda(st);
     }
-    st = cudaMalloc(&dModelStumps_, static_cast<size_t>(stumpCount) * sizeof(GpuStump4));
+    st = ensureAlloc(reinterpret_cast<void**>(&dModelStumps_),
+                     stumpCount,
+                     modelStumpCapacity_,
+                     sizeof(GpuStump4));
     if (st != cudaSuccess) {
         clearCascadeModel(stream);
         return fromCuda(st);
     }
-    st = cudaMalloc(&dModelStages_, hStages.size() * sizeof(CascadeStage));
+    st = ensureAlloc(reinterpret_cast<void**>(&dModelStages_),
+                     static_cast<int>(hStages.size()),
+                     modelStageCapacity_,
+                     sizeof(CascadeStage));
     if (st != cudaSuccess) {
         clearCascadeModel(stream);
         return fromCuda(st);
     }
     for (int r = 0; r < kLutRects; ++r) {
         for (int c = 0; c < kLutCorners; ++c) {
-            st = cudaMalloc(&dLutDx_[r][c], static_cast<size_t>(usedFeatureCount) * sizeof(int32_t));
+            st = ensureAlloc(reinterpret_cast<void**>(&dLutDx_[r][c]),
+                             usedFeatureCount,
+                             modelLutCapacity_,
+                             sizeof(int32_t));
             if (st != cudaSuccess) {
                 clearCascadeModel(stream);
                 return fromCuda(st);
             }
-            st = cudaMalloc(&dLutDy_[r][c], static_cast<size_t>(usedFeatureCount) * sizeof(int32_t));
+            st = ensureAlloc(reinterpret_cast<void**>(&dLutDy_[r][c]),
+                             usedFeatureCount,
+                             modelLutCapacity_,
+                             sizeof(int32_t));
             if (st != cudaSuccess) {
                 clearCascadeModel(stream);
                 return fromCuda(st);
             }
         }
-        st = cudaMalloc(&dLutW_[r], static_cast<size_t>(usedFeatureCount) * sizeof(float));
+        st = ensureAlloc(reinterpret_cast<void**>(&dLutW_[r]),
+                         usedFeatureCount,
+                         modelLutCapacity_,
+                         sizeof(float));
         if (st != cudaSuccess) {
             clearCascadeModel(stream);
             return fromCuda(st);
         }
     }
-    st = cudaMalloc(&dLutRectCount_, static_cast<size_t>(usedFeatureCount) * sizeof(uint8_t));
+    st = ensureAlloc(reinterpret_cast<void**>(&dLutRectCount_),
+                     usedFeatureCount,
+                     modelLutCapacity_,
+                     sizeof(uint8_t));
     if (st != cudaSuccess) {
         clearCascadeModel(stream);
         return fromCuda(st);
@@ -1097,8 +1206,12 @@ Status FaceVisionEngine::clearCascadeModel(cudaStream_t) {
         dModelFeatures_ = nullptr;
     }
     modelFeatureCount_ = 0;
+    modelFeatureCapacity_ = 0;
+    modelLutCapacity_ = 0;
     modelStumpCount_ = 0;
+    modelStumpCapacity_ = 0;
     modelStageCount_ = 0;
+    modelStageCapacity_ = 0;
     return Status::kOk;
 }
 
@@ -1338,6 +1451,14 @@ Status FaceVisionEngine::detectMultiScale(const uint8_t* dImageGray,
     if (stc != cudaSuccess) {
         return fromCuda(stc);
     }
+    stc = cudaMemcpyAsync(hDetectPinned_,
+                          dDetectOut_,
+                          static_cast<size_t>(globalCap) * sizeof(Detection),
+                          cudaMemcpyDeviceToHost,
+                          stream);
+    if (stc != cudaSuccess) {
+        return fromCuda(stc);
+    }
     stc = cudaStreamSynchronize(stream);
     if (stc != cudaSuccess) {
         return fromCuda(stc);
@@ -1347,18 +1468,6 @@ Status FaceVisionEngine::detectMultiScale(const uint8_t* dImageGray,
 
     std::vector<Detection> allDetections;
     if (hCount > 0) {
-        cudaError_t stdet = cudaMemcpyAsync(hDetectPinned_,
-                                            dDetectOut_,
-                                            static_cast<size_t>(hCount) * sizeof(Detection),
-                                            cudaMemcpyDeviceToHost,
-                                            stream);
-        if (stdet != cudaSuccess) {
-            return fromCuda(stdet);
-        }
-        stdet = cudaStreamSynchronize(stream);
-        if (stdet != cudaSuccess) {
-            return fromCuda(stdet);
-        }
         allDetections.assign(hDetectPinned_, hDetectPinned_ + hCount);
     }
 

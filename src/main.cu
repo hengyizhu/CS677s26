@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -15,7 +16,6 @@
 #include <random>
 #include <sstream>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 #include "vj/boosting_core.cuh"
@@ -28,13 +28,13 @@ using vj::AdaBoostTrainer;
 using vj::CascadeStage;
 using vj::Detection;
 using vj::FaceVisionEngine;
-using vj::FeatureBestSplit;
 using vj::FeatureTileView;
 using vj::GpuStump4;
 using vj::HaarFeature;
 using vj::IntegralImageSetT;
 using vj::LabelsView;
 using vj::Status;
+using vj::TileBestCandidate;
 using vj::WeakClassifier;
 using vj::WeightsView;
 using vj::WindowSpec;
@@ -388,6 +388,44 @@ __global__ void FillArrayKernel(float* __restrict__ arr, int n, float v) {
     if (i < n) arr[i] = v;
 }
 
+__device__ __forceinline__ TileBestCandidate betterTileCandidate(const TileBestCandidate& a,
+                                                                 const TileBestCandidate& b) {
+    if (b.bestErr < a.bestErr) return b;
+    if (b.bestErr > a.bestErr) return a;
+    if (b.featureIdx < a.featureIdx) return b;
+    return a;
+}
+
+__global__ void ReduceTileBestCandidatesKernel(const TileBestCandidate* __restrict__ in,
+                                               int n,
+                                               TileBestCandidate* __restrict__ out) {
+    __shared__ TileBestCandidate s[256];
+    const int tid = static_cast<int>(threadIdx.x);
+    TileBestCandidate local{};
+    local.bestErr = INFINITY;
+    local.bestTheta = 0.0f;
+    local.featureIdx = INT_MAX;
+    local.bestParity = +1;
+    local.pad0 = local.pad1 = local.pad2 = 0;
+
+    for (int i = tid; i < n; i += blockDim.x) {
+        local = betterTileCandidate(local, in[i]);
+    }
+    s[tid] = local;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s[tid] = betterTileCandidate(s[tid], s[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out[0] = s[0];
+    }
+}
+
 }  // namespace
 
 int runTrain(int argc, char** argv) {
@@ -638,6 +676,7 @@ int runTrain(int argc, char** argv) {
     std::vector<HaarFeature> hFeatures =
         FaceVisionEngine::buildHaarFeaturePool(win, FaceVisionEngine::FeatureMode::Core);
     const int numFeatures = static_cast<int>(hFeatures.size());
+    const int numFeatureTiles = (numFeatures + featureTile - 1) / featureTile;
     std::cout << "[INFO] Feature count: " << numFeatures << "\n";
 
     Status st = trainEngine.uploadFeaturePool(hFeatures);
@@ -685,12 +724,29 @@ int runTrain(int argc, char** argv) {
     selectedWeaks.reserve(static_cast<size_t>(maxStages) * maxWeakPerStage);
     std::vector<CascadeStage> stages;
     stages.reserve(static_cast<size_t>(maxStages));
-    std::vector<FeatureBestSplit> hTileBest(static_cast<size_t>(featureTile));
+    TileBestCandidate hTileBest{};
+    CudaBuffer<TileBestCandidate> dTileBestPerRound(static_cast<size_t>(numFeatureTiles));
+    CudaBuffer<TileBestCandidate> dRoundBest(1);
     CudaBuffer<float> dStrong(static_cast<size_t>(nSamples));
+    CudaBuffer<uint8_t> dUsedFeatureMask(static_cast<size_t>(numFeatures));
     std::vector<float> hStrong(static_cast<size_t>(nSamples), 0.0f);
     std::vector<float> posScores(static_cast<size_t>(numPos), 0.0f);
-    std::vector<float> hWeightsDbg(static_cast<size_t>(nSamples), 0.0f);
-    std::vector<float> hRespDbg(static_cast<size_t>(nSamples), 0.0f);
+    std::vector<float> hWeightsDbg;
+    std::vector<float> hRespDbg;
+
+    int debugEvery = 0;
+    if (const char* dbgEnv = std::getenv("VJ_DEBUG_EVERY")) {
+        try {
+            debugEvery = std::max(0, std::stoi(dbgEnv));
+        } catch (...) {
+            debugEvery = 0;
+        }
+    }
+    if (debugEvery > 0) {
+        hWeightsDbg.assign(static_cast<size_t>(nSamples), 0.0f);
+        hRespDbg.assign(static_cast<size_t>(nSamples), 0.0f);
+        std::cout << "[INFO] Debug logging enabled: VJ_DEBUG_EVERY=" << debugEvery << "\n";
+    }
 
     const dim3 blk(256, 1, 1);
     const dim3 grd(static_cast<unsigned>((nSamples + 255) / 256), 1, 1);
@@ -986,24 +1042,29 @@ int runTrain(int argc, char** argv) {
             return 1;
         }
 
-        if (cudaMemcpy(hWeightsDbg.data(),
-                       dWeight.data(),
-                       static_cast<size_t>(nSamples) * sizeof(float),
-                       cudaMemcpyDeviceToHost) != cudaSuccess) {
-            std::cerr << "[ERR] copy weights for debug failed at stage init\n";
+        if (debugEvery > 0) {
+            if (cudaMemcpy(hWeightsDbg.data(),
+                           dWeight.data(),
+                           static_cast<size_t>(nSamples) * sizeof(float),
+                           cudaMemcpyDeviceToHost) != cudaSuccess) {
+                std::cerr << "[ERR] copy weights for debug failed at stage init\n";
+                return 1;
+            }
+            float initPosW = 0.0f;
+            float initNegW = 0.0f;
+            for (int i = 0; i < numPos; ++i) initPosW += hWeightsDbg[static_cast<size_t>(i)];
+            for (int i = numPos; i < nSamples; ++i) initNegW += hWeightsDbg[static_cast<size_t>(i)];
+            std::cout << "[DBG] stage=" << stageIdx
+                      << " initWeightSum pos=" << initPosW
+                      << " neg=" << initNegW
+                      << " activeNeg=" << stageNegBaseCount
+                      << "\n";
+        }
+
+        if (cudaMemset(dUsedFeatureMask.data(), 0, static_cast<size_t>(numFeatures) * sizeof(uint8_t)) != cudaSuccess) {
+            std::cerr << "[ERR] clear used-feature mask failed\n";
             return 1;
         }
-        float initPosW = 0.0f;
-        float initNegW = 0.0f;
-        for (int i = 0; i < numPos; ++i) initPosW += hWeightsDbg[static_cast<size_t>(i)];
-        for (int i = numPos; i < nSamples; ++i) initNegW += hWeightsDbg[static_cast<size_t>(i)];
-        std::cout << "[DBG] stage=" << stageIdx
-                  << " initWeightSum pos=" << initPosW
-                  << " neg=" << initNegW
-                  << " activeNeg=" << stageNegBaseCount
-                  << "\n";
-
-        std::unordered_set<int> usedFeatures;
         const int stageFirst = static_cast<int>(selectedWeaks.size());
         float stageThreshold = 0.0f;
         bool stageSatisfied = false;
@@ -1025,6 +1086,7 @@ int runTrain(int argc, char** argv) {
             int bestParity = +1;
             int bestFeature = -1;
 
+            int tileIdx = 0;
             for (int begin = 0; begin < numFeatures; begin += featureTile) {
                 const int count = std::min(featureTile, numFeatures - begin);
 
@@ -1053,34 +1115,45 @@ int runTrain(int argc, char** argv) {
                     return 1;
                 }
 
-                if (cudaMemcpy(hTileBest.data(), trainer.bestBuffer(),
-                               static_cast<size_t>(count) * sizeof(FeatureBestSplit),
-                               cudaMemcpyDeviceToHost) != cudaSuccess) {
-                    std::cerr << "[ERR] memcpy bestBuffer failed\n";
+                st = trainer.selectBestInTile(begin,
+                                              count,
+                                              dUsedFeatureMask.data(),
+                                              dTileBestPerRound.data() + tileIdx);
+                if (st != Status::kOk) {
+                    std::cerr << "[ERR] selectBestInTile failed: " << statusToString(st) << "\n";
                     return 1;
                 }
-
-                for (int i = 0; i < count; ++i) {
-                    const int featureIdx = begin + i;
-                    if (usedFeatures.find(featureIdx) != usedFeatures.end()) {
-                        continue;  // stage-level tabu: avoid feature collapse.
-                    }
-                    const FeatureBestSplit& b = hTileBest[static_cast<size_t>(i)];
-                    if (b.bestErr < bestErr) {
-                        bestErr = b.bestErr;
-                        bestTheta = b.bestTheta;
-                        bestParity = b.bestParity;
-                        bestFeature = featureIdx;
-                    }
-                }
+                ++tileIdx;
             }
+
+            ReduceTileBestCandidatesKernel<<<1, 256>>>(dTileBestPerRound.data(), tileIdx, dRoundBest.data());
+            if (cudaGetLastError() != cudaSuccess) {
+                std::cerr << "[ERR] ReduceTileBestCandidatesKernel launch failed\n";
+                return 1;
+            }
+            if (cudaMemcpy(&hTileBest,
+                           dRoundBest.data(),
+                           sizeof(TileBestCandidate),
+                           cudaMemcpyDeviceToHost) != cudaSuccess) {
+                std::cerr << "[ERR] memcpy round-best failed\n";
+                return 1;
+            }
+            bestErr = hTileBest.bestErr;
+            bestTheta = hTileBest.bestTheta;
+            bestParity = hTileBest.bestParity;
+            bestFeature = hTileBest.featureIdx;
 
             if (!(bestFeature >= 0) || !std::isfinite(bestErr)) {
                 std::cerr << "[WARN] No valid weak found at stage " << stageIdx
                           << " weakRound " << weakRound << "\n";
                 break;
             }
-            usedFeatures.insert(bestFeature);
+            if (cudaMemsetAsync(dUsedFeatureMask.data() + bestFeature,
+                                1,
+                                sizeof(uint8_t)) != cudaSuccess) {
+                std::cerr << "[ERR] mark used-feature mask failed\n";
+                return 1;
+            }
 
             const float eps = 1e-6f;
             const float errClamped = std::min(std::max(bestErr, eps), 1.0f - eps);
@@ -1110,7 +1183,9 @@ int runTrain(int argc, char** argv) {
                 return 1;
             }
 
-            if ((weakRound % 10) == 0 || weakRound == stageWeakLimit - 1) {
+            const bool emitDebug = (debugEvery > 0) &&
+                                   ((weakRound % debugEvery) == 0 || weakRound == stageWeakLimit - 1);
+            if (emitDebug) {
                 if (cudaMemcpy(hRespDbg.data(),
                                trainer.responseBuffer(),
                                static_cast<size_t>(nSamples) * sizeof(float),
@@ -1196,7 +1271,7 @@ int runTrain(int argc, char** argv) {
 
             const float falseAlarm = static_cast<float>(negSurvive) / static_cast<float>(stageNegBaseCount);
 
-            if ((weakRound % 10) == 0 || weakRound == stageWeakLimit - 1) {
+            if (emitDebug) {
                 float posMin = std::numeric_limits<float>::infinity();
                 float posMax = -std::numeric_limits<float>::infinity();
                 double posSum = 0.0;
