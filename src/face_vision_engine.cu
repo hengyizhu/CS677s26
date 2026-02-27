@@ -1463,14 +1463,6 @@ Status FaceVisionEngine::detectMultiScale(const uint8_t* dImageGray,
     if (stc != cudaSuccess) {
         return fromCuda(stc);
     }
-    stc = cudaMemcpyAsync(hDetectPinned_,
-                          dDetectOut_,
-                          static_cast<size_t>(globalCap) * sizeof(Detection),
-                          cudaMemcpyDeviceToHost,
-                          stream);
-    if (stc != cudaSuccess) {
-        return fromCuda(stc);
-    }
     stc = cudaStreamSynchronize(stream);
     if (stc != cudaSuccess) {
         return fromCuda(stc);
@@ -1480,6 +1472,13 @@ Status FaceVisionEngine::detectMultiScale(const uint8_t* dImageGray,
 
     std::vector<Detection> allDetections;
     if (hCount > 0) {
+        stc = cudaMemcpy(hDetectPinned_,
+                         dDetectOut_,
+                         static_cast<size_t>(hCount) * sizeof(Detection),
+                         cudaMemcpyDeviceToHost);
+        if (stc != cudaSuccess) {
+            return fromCuda(stc);
+        }
         allDetections.assign(hDetectPinned_, hDetectPinned_ + hCount);
     }
 

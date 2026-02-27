@@ -373,6 +373,22 @@ __global__ void ApplyActiveMaskToWeightsKernel(float* __restrict__ weights,
     }
 }
 
+__global__ void ResetStageWeightsKernel(float* __restrict__ weights,
+                                        uint8_t* __restrict__ active,
+                                        int n,
+                                        int numPos,
+                                        float wPos,
+                                        float wNeg) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= n) return;
+    if (i < numPos) {
+        active[i] = 1;
+        weights[i] = wPos;
+    } else {
+        weights[i] = (active[i] != 0) ? wNeg : 0.0f;
+    }
+}
+
 __global__ void AccumulateStrongScoreKernel(const float* __restrict__ resp,
                                             float* __restrict__ strong,
                                             int n,
@@ -831,19 +847,15 @@ int runTrain(int argc, char** argv) {
         if (activeNegCount <= 0) {
             return false;
         }
-        std::fill(hWeights.begin(), hWeights.end(), 0.0f);
         const float wPos = 0.5f / static_cast<float>(numPos);
         const float wNeg = 0.5f / static_cast<float>(activeNegCount);
-        for (int i = 0; i < numPos; ++i) {
-            hWeights[i] = wPos;
-            hActive[i] = 1;
-        }
-        for (int i = numPos; i < nSamples; ++i) {
-            hWeights[i] = (hActive[i] != 0) ? wNeg : 0.0f;
-        }
-        return cudaMemcpy(dWeight.data(), hWeights.data(),
-                          static_cast<size_t>(nSamples) * sizeof(float),
-                          cudaMemcpyHostToDevice) == cudaSuccess;
+        ResetStageWeightsKernel<<<grd, blk>>>(dWeight.data(),
+                                              dActive.data(),
+                                              nSamples,
+                                              numPos,
+                                              wPos,
+                                              wNeg);
+        return cudaGetLastError() == cudaSuccess;
     };
 
     cudaDeviceSynchronize();
