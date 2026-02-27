@@ -33,12 +33,21 @@ struct LocalBest {
     int parity;
 };
 
+struct WeightPair {
+    float pos;
+    float neg;
+};
+
 struct TileBestLocal {
     float err;
     float theta;
     int featureIdx;
     int parity;
 };
+
+__device__ __forceinline__ WeightPair operator+(const WeightPair& a, const WeightPair& b) {
+    return WeightPair{a.pos + b.pos, a.neg + b.neg};
+}
 
 __device__ __forceinline__ LocalBest betterBest(const LocalBest& a, const LocalBest& b) {
     if (b.err < a.err) {
@@ -59,6 +68,12 @@ __device__ __forceinline__ LocalBest betterBest(const LocalBest& a, const LocalB
     }
     return a;
 }
+
+struct BetterBestOp {
+    __device__ __forceinline__ LocalBest operator()(const LocalBest& a, const LocalBest& b) const {
+        return betterBest(a, b);
+    }
+};
 
 __device__ __forceinline__ TileBestLocal betterTileBest(const TileBestLocal& a, const TileBestLocal& b) {
     if (b.err < a.err) {
@@ -205,11 +220,12 @@ __global__ void EvaluateAndFindThresholdKernel(const float* __restrict__ d_resp,
     const float* respRow = d_resp + static_cast<size_t>(featureLocal) * nSamples;
     const uint16_t* ord = d_sortedIdx + static_cast<size_t>(featureLocal) * nSamples;
 
-    __shared__ float sPos[kThresholdThreads];
-    __shared__ float sNeg[kThresholdThreads];
-    __shared__ float sErr[kThresholdThreads];
-    __shared__ int sSplit[kThresholdThreads];
-    __shared__ int sParity[kThresholdThreads];
+    using PairReduce = cub::BlockReduce<WeightPair, kThresholdThreads>;
+    using FloatScan = cub::BlockScan<float, kThresholdThreads>;
+    using BestReduce = cub::BlockReduce<LocalBest, kThresholdThreads>;
+    __shared__ typename PairReduce::TempStorage sPairReduce;
+    __shared__ typename FloatScan::TempStorage sScan;
+    __shared__ typename BestReduce::TempStorage sBestReduce;
 
     __shared__ float sTotalPos;
     __shared__ float sTotalNeg;
@@ -236,22 +252,12 @@ __global__ void EvaluateAndFindThresholdKernel(const float* __restrict__ d_resp,
         }
     }
 
-    sPos[tid] = localPos;
-    sNeg[tid] = localNeg;
+    const WeightPair totals = PairReduce(sPairReduce).Sum(WeightPair{localPos, localNeg});
     __syncthreads();
 
-    // Block reduction for totals.
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            sPos[tid] += sPos[tid + stride];
-            sNeg[tid] += sNeg[tid + stride];
-        }
-        __syncthreads();
-    }
-
     if (tid == 0) {
-        sTotalPos = sPos[0];
-        sTotalNeg = sNeg[0];
+        sTotalPos = totals.pos;
+        sTotalNeg = totals.neg;
         sCarryPos = 0.0f;
         sCarryNeg = 0.0f;
     }
@@ -281,27 +287,14 @@ __global__ void EvaluateAndFindThresholdKernel(const float* __restrict__ d_resp,
             }
         }
 
-        sPos[tid] = wp;
-        sNeg[tid] = wn;
+        float prefPos = 0.0f;
+        float prefNeg = 0.0f;
+        float blockAggPos = 0.0f;
+        float blockAggNeg = 0.0f;
+        FloatScan(sScan).InclusiveSum(wp, prefPos, blockAggPos);
         __syncthreads();
-
-        // Shared-memory inclusive prefix scan.
-        // 中文: 每轮 offset 翻倍，先读旧值再同步，再写回，避免读写冲突。
-        // EN: Doubling-offset inclusive scan with synchronized read/modify/write.
-        for (int offset = 1; offset < blockDim.x; offset <<= 1) {
-            float addPos = 0.0f;
-            float addNeg = 0.0f;
-            if (tid >= offset) {
-                addPos = sPos[tid - offset];
-                addNeg = sNeg[tid - offset];
-            }
-            __syncthreads();
-            if (tid >= offset) {
-                sPos[tid] += addPos;
-                sNeg[tid] += addNeg;
-            }
-            __syncthreads();
-        }
+        FloatScan(sScan).InclusiveSum(wn, prefNeg, blockAggNeg);
+        __syncthreads();
 
         const float carryPos = sCarryPos;
         const float carryNeg = sCarryNeg;
@@ -315,8 +308,8 @@ __global__ void EvaluateAndFindThresholdKernel(const float* __restrict__ d_resp,
 
             // Only consider valid threshold between distinct sorted values.
             if (v0 + kValueEps < v1) {
-                const float wPosLeft = carryPos + sPos[tid];
-                const float wNegLeft = carryNeg + sNeg[tid];
+                const float wPosLeft = carryPos + prefPos;
+                const float wNegLeft = carryNeg + prefNeg;
                 const float wPosRight = sTotalPos - wPosLeft;
                 const float wNegRight = sTotalNeg - wNegLeft;
 
@@ -336,11 +329,8 @@ __global__ void EvaluateAndFindThresholdKernel(const float* __restrict__ d_resp,
 
         // Update carries (cumulative left-side sums) once per tile.
         if (tid == 0) {
-            const int validCount = min(blockDim.x, nSamples - base);
-            if (validCount > 0) {
-                sCarryPos += sPos[validCount - 1];
-                sCarryNeg += sNeg[validCount - 1];
-            }
+            sCarryPos += blockAggPos;
+            sCarryNeg += blockAggNeg;
         }
         __syncthreads();
     }
@@ -348,28 +338,14 @@ __global__ void EvaluateAndFindThresholdKernel(const float* __restrict__ d_resp,
     // -------------------------------------
     // Step C: block min reduction for best.
     // -------------------------------------
-    sErr[tid] = best.err;
-    sSplit[tid] = best.split;
-    sParity[tid] = best.parity;
+    const LocalBest blockBest = BestReduce(sBestReduce).Reduce(best, BetterBestOp{});
     __syncthreads();
-
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            LocalBest a{sErr[tid], sSplit[tid], sParity[tid]};
-            LocalBest b{sErr[tid + stride], sSplit[tid + stride], sParity[tid + stride]};
-            const LocalBest c = betterBest(a, b);
-            sErr[tid] = c.err;
-            sSplit[tid] = c.split;
-            sParity[tid] = c.parity;
-        }
-        __syncthreads();
-    }
 
     if (tid == 0) {
         FeatureBestSplit out{};
-        out.bestErr = sErr[0];
-        out.bestSplitPos = sSplit[0];
-        out.bestParity = static_cast<int8_t>(sParity[0]);
+        out.bestErr = blockBest.err;
+        out.bestSplitPos = blockBest.split;
+        out.bestParity = static_cast<int8_t>(blockBest.parity);
 
         if (out.bestSplitPos >= 0 && out.bestSplitPos < nSamples - 1) {
             const int si0 = static_cast<int>(ord[out.bestSplitPos]);
