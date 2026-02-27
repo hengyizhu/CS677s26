@@ -70,6 +70,14 @@ struct FeatureBestSplit {
     int8_t pad0, pad1, pad2;
 };
 
+struct TileBestCandidate {
+    float bestErr;
+    float bestTheta;
+    int32_t featureIdx;
+    int8_t bestParity;
+    int8_t pad0, pad1, pad2;
+};
+
 struct WeakClassifier {
     int featureIdx;
     float theta;

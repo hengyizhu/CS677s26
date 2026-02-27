@@ -33,6 +33,13 @@ public:
                                     FeatureBestSplit* dOutBestPerFeature = nullptr,
                                     cudaStream_t stream = nullptr) const;
 
+    // Reduce per-feature best splits to one tile-level best candidate on GPU.
+    Status selectBestInTile(int featureBegin,
+                            int featureCount,
+                            const uint8_t* dUsedFeatureMask,
+                            TileBestCandidate* dOut = nullptr,
+                            cudaStream_t stream = nullptr) const;
+
     // Segmented sort: for each feature row, sort sample indices by response value.
     // Input dResp layout: [featureCount][nSamples]
     // Output dOutSortedIdx layout: [featureCount][nSamples]
@@ -46,6 +53,8 @@ public:
 
     FeatureBestSplit* bestBuffer() noexcept { return dBestBuffer_; }
     const FeatureBestSplit* bestBuffer() const noexcept { return dBestBuffer_; }
+    TileBestCandidate* tileBestBuffer() noexcept { return dTileBestBuffer_; }
+    const TileBestCandidate* tileBestBuffer() const noexcept { return dTileBestBuffer_; }
     const uint16_t* sortedIndexBuffer() const noexcept { return dSortValsOut_; }
 
     int maxSamples() const noexcept { return maxSamples_; }
@@ -65,15 +74,17 @@ private:
     // RAII-owned device buffers for this boosting core
     float* dResponseBuffer_ = nullptr;            // [maxFeaturesPerTile][maxSamples]
     FeatureBestSplit* dBestBuffer_ = nullptr;     // [maxFeaturesPerTile]
+    TileBestCandidate* dTileBestBuffer_ = nullptr; // [1]
 
     // Segmented sort working set (allocated once, reused per boosting round)
-    float* dSortKeysIn_ = nullptr;                // [maxFeaturesPerTile][maxSamples]
     float* dSortKeysOut_ = nullptr;               // [maxFeaturesPerTile][maxSamples]
     uint16_t* dSortValsIn_ = nullptr;             // [maxFeaturesPerTile][maxSamples]
     uint16_t* dSortValsOut_ = nullptr;            // [maxFeaturesPerTile][maxSamples]
     int* dSegmentOffsets_ = nullptr;              // [maxFeaturesPerTile + 1]
     void* dSortTempStorage_ = nullptr;            // CUB temp buffer
     size_t sortTempStorageBytes_ = 0;
+    int sortLayoutSamples_ = 0;                   // nSamples used for dSortValsIn_/dSegmentOffsets_
+    bool sortLayoutReady_ = false;
 };
 
 } // namespace vj

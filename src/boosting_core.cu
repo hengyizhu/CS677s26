@@ -33,6 +33,13 @@ struct LocalBest {
     int parity;
 };
 
+struct TileBestLocal {
+    float err;
+    float theta;
+    int featureIdx;
+    int parity;
+};
+
 __device__ __forceinline__ LocalBest betterBest(const LocalBest& a, const LocalBest& b) {
     if (b.err < a.err) {
         return b;
@@ -48,6 +55,19 @@ __device__ __forceinline__ LocalBest betterBest(const LocalBest& a, const LocalB
         return a;
     }
     if (b.parity > a.parity) {
+        return b;
+    }
+    return a;
+}
+
+__device__ __forceinline__ TileBestLocal betterTileBest(const TileBestLocal& a, const TileBestLocal& b) {
+    if (b.err < a.err) {
+        return b;
+    }
+    if (b.err > a.err) {
+        return a;
+    }
+    if (b.featureIdx < a.featureIdx) {
         return b;
     }
     return a;
@@ -71,6 +91,44 @@ __global__ void FillSegmentOffsetsKernel(int* __restrict__ d_offsets,
         return;
     }
     d_offsets[i] = i * nSamples;
+}
+
+__global__ void SelectBestInTileKernel(const FeatureBestSplit* __restrict__ d_best,
+                                       int featureBegin,
+                                       int featureCount,
+                                       const uint8_t* __restrict__ d_usedMask,
+                                       TileBestCandidate* __restrict__ d_out) {
+    const int tid = static_cast<int>(threadIdx.x);
+    __shared__ TileBestLocal sBest[kThresholdThreads];
+
+    TileBestLocal local{FLT_MAX, 0.0f, INT_MAX, +1};
+    for (int i = tid; i < featureCount; i += blockDim.x) {
+        const int featureIdx = featureBegin + i;
+        if (d_usedMask && d_usedMask[featureIdx] != 0) {
+            continue;
+        }
+        const FeatureBestSplit b = d_best[i];
+        TileBestLocal cand{b.bestErr, b.bestTheta, featureIdx, static_cast<int>(b.bestParity)};
+        local = betterTileBest(local, cand);
+    }
+    sBest[tid] = local;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sBest[tid] = betterTileBest(sBest[tid], sBest[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        TileBestCandidate out{};
+        out.bestErr = sBest[0].err;
+        out.bestTheta = sBest[0].theta;
+        out.featureIdx = sBest[0].featureIdx;
+        out.bestParity = static_cast<int8_t>(sBest[0].parity);
+        d_out[0] = out;
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -345,6 +403,7 @@ AdaBoostTrainer::AdaBoostTrainer(const WindowSpec& win, int maxSamples, int maxF
     }
     const size_t respBytes = respCount * sizeof(float);
     const size_t bestBytes = static_cast<size_t>(maxFeaturesPerTile_) * sizeof(FeatureBestSplit);
+    const size_t tileBestBytes = sizeof(TileBestCandidate);
     const size_t idxBytes = respCount * sizeof(uint16_t);
     const size_t segOfsBytes = static_cast<size_t>(maxFeaturesPerTile_ + 1) * sizeof(int);
 
@@ -360,9 +419,9 @@ AdaBoostTrainer::AdaBoostTrainer(const WindowSpec& win, int maxSamples, int maxF
                        "AdaBoostTrainer: cudaMalloc dResponseBuffer_ failed");
         alloc_or_throw(reinterpret_cast<void**>(&dBestBuffer_), bestBytes,
                        "AdaBoostTrainer: cudaMalloc dBestBuffer_ failed");
+        alloc_or_throw(reinterpret_cast<void**>(&dTileBestBuffer_), tileBestBytes,
+                       "AdaBoostTrainer: cudaMalloc dTileBestBuffer_ failed");
 
-        alloc_or_throw(reinterpret_cast<void**>(&dSortKeysIn_), respBytes,
-                       "AdaBoostTrainer: cudaMalloc dSortKeysIn_ failed");
         alloc_or_throw(reinterpret_cast<void**>(&dSortKeysOut_), respBytes,
                        "AdaBoostTrainer: cudaMalloc dSortKeysOut_ failed");
         alloc_or_throw(reinterpret_cast<void**>(&dSortValsIn_), idxBytes,
@@ -376,7 +435,7 @@ AdaBoostTrainer::AdaBoostTrainer(const WindowSpec& win, int maxSamples, int maxF
         cudaError_t st = cub::DeviceSegmentedRadixSort::SortPairs(
             nullptr,
             sortTempStorageBytes_,
-            dSortKeysIn_,
+            dResponseBuffer_,
             dSortKeysOut_,
             dSortValsIn_,
             dSortValsOut_,
@@ -400,7 +459,7 @@ AdaBoostTrainer::AdaBoostTrainer(const WindowSpec& win, int maxSamples, int maxF
         if (dSortValsOut_) cudaFree(dSortValsOut_);
         if (dSortValsIn_) cudaFree(dSortValsIn_);
         if (dSortKeysOut_) cudaFree(dSortKeysOut_);
-        if (dSortKeysIn_) cudaFree(dSortKeysIn_);
+        if (dTileBestBuffer_) cudaFree(dTileBestBuffer_);
         if (dBestBuffer_) cudaFree(dBestBuffer_);
         if (dResponseBuffer_) cudaFree(dResponseBuffer_);
         dSortTempStorage_ = nullptr;
@@ -408,7 +467,7 @@ AdaBoostTrainer::AdaBoostTrainer(const WindowSpec& win, int maxSamples, int maxF
         dSortValsOut_ = nullptr;
         dSortValsIn_ = nullptr;
         dSortKeysOut_ = nullptr;
-        dSortKeysIn_ = nullptr;
+        dTileBestBuffer_ = nullptr;
         dBestBuffer_ = nullptr;
         dResponseBuffer_ = nullptr;
         throw;
@@ -436,9 +495,9 @@ AdaBoostTrainer::~AdaBoostTrainer() {
         cudaFree(dSortKeysOut_);
         dSortKeysOut_ = nullptr;
     }
-    if (dSortKeysIn_) {
-        cudaFree(dSortKeysIn_);
-        dSortKeysIn_ = nullptr;
+    if (dTileBestBuffer_) {
+        cudaFree(dTileBestBuffer_);
+        dTileBestBuffer_ = nullptr;
     }
     if (dResponseBuffer_) {
         cudaFree(dResponseBuffer_);
@@ -487,9 +546,9 @@ AdaBoostTrainer& AdaBoostTrainer::operator=(AdaBoostTrainer&& other) noexcept {
         cudaFree(dSortKeysOut_);
         dSortKeysOut_ = nullptr;
     }
-    if (dSortKeysIn_) {
-        cudaFree(dSortKeysIn_);
-        dSortKeysIn_ = nullptr;
+    if (dTileBestBuffer_) {
+        cudaFree(dTileBestBuffer_);
+        dTileBestBuffer_ = nullptr;
     }
 
     win_ = other.win_;
@@ -500,13 +559,15 @@ AdaBoostTrainer& AdaBoostTrainer::operator=(AdaBoostTrainer&& other) noexcept {
     weights_ = other.weights_;
     dResponseBuffer_ = other.dResponseBuffer_;
     dBestBuffer_ = other.dBestBuffer_;
-    dSortKeysIn_ = other.dSortKeysIn_;
     dSortKeysOut_ = other.dSortKeysOut_;
     dSortValsIn_ = other.dSortValsIn_;
     dSortValsOut_ = other.dSortValsOut_;
     dSegmentOffsets_ = other.dSegmentOffsets_;
     dSortTempStorage_ = other.dSortTempStorage_;
     sortTempStorageBytes_ = other.sortTempStorageBytes_;
+    dTileBestBuffer_ = other.dTileBestBuffer_;
+    sortLayoutSamples_ = other.sortLayoutSamples_;
+    sortLayoutReady_ = other.sortLayoutReady_;
 
     other.maxSamples_ = 0;
     other.maxFeaturesPerTile_ = 0;
@@ -515,13 +576,15 @@ AdaBoostTrainer& AdaBoostTrainer::operator=(AdaBoostTrainer&& other) noexcept {
     other.weights_ = WeightsView{};
     other.dResponseBuffer_ = nullptr;
     other.dBestBuffer_ = nullptr;
-    other.dSortKeysIn_ = nullptr;
     other.dSortKeysOut_ = nullptr;
     other.dSortValsIn_ = nullptr;
     other.dSortValsOut_ = nullptr;
     other.dSegmentOffsets_ = nullptr;
     other.dSortTempStorage_ = nullptr;
+    other.dTileBestBuffer_ = nullptr;
     other.sortTempStorageBytes_ = 0;
+    other.sortLayoutSamples_ = 0;
+    other.sortLayoutReady_ = false;
     return *this;
 }
 
@@ -545,6 +608,33 @@ Status AdaBoostTrainer::bindTrainingSet(const IntegralImageSetT& iiSet,
     iiSet_ = iiSet;
     labels_ = labels;
     weights_ = weights;
+
+    if (!sortLayoutReady_ || sortLayoutSamples_ != iiSet.nSamples) {
+        const int nSamples = iiSet.nSamples;
+        {
+            const dim3 block(kSortThreads, 1, 1);
+            const dim3 grid(static_cast<unsigned>((nSamples + kSortThreads - 1) / kSortThreads),
+                            static_cast<unsigned>(maxFeaturesPerTile_),
+                            1);
+            InitSortValueIndicesKernel<<<grid, block>>>(dSortValsIn_, nSamples);
+            const cudaError_t st = cudaGetLastError();
+            if (st != cudaSuccess) {
+                return fromCuda(st);
+            }
+        }
+        {
+            const dim3 block(kSortThreads, 1, 1);
+            const int n = maxFeaturesPerTile_ + 1;
+            const dim3 grid(static_cast<unsigned>((n + kSortThreads - 1) / kSortThreads), 1, 1);
+            FillSegmentOffsetsKernel<<<grid, block>>>(dSegmentOffsets_, maxFeaturesPerTile_, nSamples);
+            const cudaError_t st = cudaGetLastError();
+            if (st != cudaSuccess) {
+                return fromCuda(st);
+            }
+        }
+        sortLayoutSamples_ = nSamples;
+        sortLayoutReady_ = true;
+    }
     return Status::kOk;
 }
 
@@ -633,29 +723,8 @@ Status AdaBoostTrainer::sortSamplesPerFeature(const float* dResp,
 
     const int totalItems = featureCount * nSamples;
 
-    // Build value array = sample indices [0..N-1] repeated per feature segment.
-    {
-        const dim3 block(kSortThreads, 1, 1);
-        const dim3 grid(static_cast<unsigned>((nSamples + kSortThreads - 1) / kSortThreads),
-                        static_cast<unsigned>(featureCount),
-                        1);
-        InitSortValueIndicesKernel<<<grid, block, 0, stream>>>(dSortValsIn_, nSamples);
-        const cudaError_t st = cudaGetLastError();
-        if (st != cudaSuccess) {
-            return fromCuda(st);
-        }
-    }
-
-    // Build segment offsets: [0, N, 2N, ... featureCount*N].
-    {
-        const dim3 block(kSortThreads, 1, 1);
-        const int n = featureCount + 1;
-        const dim3 grid(static_cast<unsigned>((n + kSortThreads - 1) / kSortThreads), 1, 1);
-        FillSegmentOffsetsKernel<<<grid, block, 0, stream>>>(dSegmentOffsets_, featureCount, nSamples);
-        const cudaError_t st = cudaGetLastError();
-        if (st != cudaSuccess) {
-            return fromCuda(st);
-        }
+    if (!sortLayoutReady_ || sortLayoutSamples_ != nSamples) {
+        return Status::kInvalidArg;
     }
 
     // Sort all feature segments in one CUB call.
@@ -688,6 +757,32 @@ Status AdaBoostTrainer::sortSamplesPerFeature(const float* dResp,
         return fromCuda(copySt);
     }
     return Status::kOk;
+}
+
+Status AdaBoostTrainer::selectBestInTile(int featureBegin,
+                                         int featureCount,
+                                         const uint8_t* dUsedFeatureMask,
+                                         TileBestCandidate* dOut,
+                                         cudaStream_t stream) const {
+    if (featureBegin < 0 || featureCount <= 0 || featureCount > maxFeaturesPerTile_) {
+        return Status::kInvalidArg;
+    }
+    if (!dBestBuffer_) {
+        return Status::kInvalidArg;
+    }
+    TileBestCandidate* out = dOut ? dOut : dTileBestBuffer_;
+    if (!out) {
+        return Status::kInvalidArg;
+    }
+
+    const dim3 block(kThresholdThreads, 1, 1);
+    const dim3 grid(1, 1, 1);
+    SelectBestInTileKernel<<<grid, block, 0, stream>>>(dBestBuffer_,
+                                                        featureBegin,
+                                                        featureCount,
+                                                        dUsedFeatureMask,
+                                                        out);
+    return fromCuda(cudaGetLastError());
 }
 
 } // namespace vj
