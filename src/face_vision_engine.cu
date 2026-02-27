@@ -1237,10 +1237,27 @@ std::vector<Detection> FaceVisionEngine::groupRectanglesCpu(const std::vector<De
     const int n = static_cast<int>(in.size());
     DisjointSet dsu(n);
 
-    // OpenCV groupRectangles style clustering: merge similar rectangles.
-    for (int i = 0; i < n; ++i) {
-        for (int j = i + 1; j < n; ++j) {
-            if (similarRects(in[i], in[j], eps)) {
+    // Sweep-line candidate pruning on x to reduce pair checks while keeping exact similarRects test.
+    std::vector<int> order(static_cast<size_t>(n), 0);
+    for (int i = 0; i < n; ++i) order[static_cast<size_t>(i)] = i;
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        if (in[static_cast<size_t>(a)].x != in[static_cast<size_t>(b)].x) {
+            return in[static_cast<size_t>(a)].x < in[static_cast<size_t>(b)].x;
+        }
+        return a < b;
+    });
+
+    for (int oi = 0; oi < n; ++oi) {
+        const int i = order[static_cast<size_t>(oi)];
+        const Detection& a = in[static_cast<size_t>(i)];
+        const int maxDx = static_cast<int>(eps * static_cast<float>(a.w + a.h) * 0.5f);
+        for (int oj = oi + 1; oj < n; ++oj) {
+            const int j = order[static_cast<size_t>(oj)];
+            const Detection& b = in[static_cast<size_t>(j)];
+            if (b.x - a.x > maxDx) {
+                break;
+            }
+            if (similarRects(a, b, eps)) {
                 dsu.unite(i, j);
             }
         }
