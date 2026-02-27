@@ -1,0 +1,8 @@
+logs/
+build/
+.venv/
+data_cache/
+demo_input.pgm
+demo_input.png
+detection_result.ppm
+detection_result.png
