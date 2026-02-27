@@ -218,7 +218,8 @@ __global__ void ResizeBilinearKernel(const uint8_t* __restrict__ d_src,
                                      int dstW,
                                      int dstH,
                                      int dstStride,
-                                     float scale) {
+                                     float scaleX,
+                                     float scaleY) {
     const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
     if (x >= dstW || y >= dstH) {
@@ -226,8 +227,8 @@ __global__ void ResizeBilinearKernel(const uint8_t* __restrict__ d_src,
     }
 
     // Match OpenCV resize geometry: map destination pixel centers to source space.
-    const float fx = (static_cast<float>(x) + 0.5f) * scale - 0.5f;
-    const float fy = (static_cast<float>(y) + 0.5f) * scale - 0.5f;
+    const float fx = (static_cast<float>(x) + 0.5f) * scaleX - 0.5f;
+    const float fy = (static_cast<float>(y) + 0.5f) * scaleY - 0.5f;
 
     const int sx0 = max(0, min(static_cast<int>(floorf(fx)), srcW - 1));
     const int sy0 = max(0, min(static_cast<int>(floorf(fy)), srcH - 1));
@@ -1369,6 +1370,10 @@ Status FaceVisionEngine::detectMultiScale(const uint8_t* dImageGray,
 
     float scale = 1.0f;
     int scaleIdx = 0;
+    const uint8_t* dPrevScaled = dImageGray;
+    int prevW = imageW;
+    int prevH = imageH;
+    int prevStride = imageStride;
 
     while (true) {
         const int scaledW = static_cast<int>(std::round(static_cast<float>(imageW) / scale));
@@ -1395,25 +1400,33 @@ Status FaceVisionEngine::detectMultiScale(const uint8_t* dImageGray,
             dScaled = dImageGray;
             scaledStride = imageStride;
         } else {
-            dScaled = dPyrBufA_;
+            uint8_t* dDst = (scaleIdx & 1) ? dPyrBufA_ : dPyrBufB_;
+            dScaled = dDst;
             scaledStride = scaledW;
             const dim3 block(16, 16, 1);
             const dim3 grid(static_cast<unsigned>(divUpHost(scaledW, 16)),
                             static_cast<unsigned>(divUpHost(scaledH, 16)),
                             1);
-            ResizeBilinearKernel<<<grid, block, 0, stream>>>(dImageGray,
-                                                              imageW,
-                                                              imageH,
-                                                              imageStride,
-                                                              dPyrBufA_,
+            const float resizeX = static_cast<float>(prevW) / static_cast<float>(scaledW);
+            const float resizeY = static_cast<float>(prevH) / static_cast<float>(scaledH);
+            ResizeBilinearKernel<<<grid, block, 0, stream>>>(dPrevScaled,
+                                                              prevW,
+                                                              prevH,
+                                                              prevStride,
+                                                              dDst,
                                                               scaledW,
                                                               scaledH,
                                                               scaledStride,
-                                                              scale);
+                                                              resizeX,
+                                                              resizeY);
             cudaError_t st = cudaGetLastError();
             if (st != cudaSuccess) {
                 return fromCuda(st);
             }
+            dPrevScaled = dScaled;
+            prevW = scaledW;
+            prevH = scaledH;
+            prevStride = scaledStride;
         }
 
         Status s = computeIntegralBatchTransposed(dScaled, scaledW, scaledH, scaledStride, 1, stream);
