@@ -494,6 +494,17 @@ __global__ void UpdateActiveNegByThresholdKernel(const float* __restrict__ stron
     }
 }
 
+__global__ void CountActiveNegKernel(const uint8_t* __restrict__ active,
+                                     int nSamples,
+                                     int numPos,
+                                     int* __restrict__ outCount) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= nSamples || i < numPos) return;
+    if (active[i] != 0) {
+        atomicAdd(outCount, 1);
+    }
+}
+
 __global__ void FillArrayKernel(float* __restrict__ arr, int n, float v) {
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i < n) arr[i] = v;
@@ -843,6 +854,7 @@ int runTrain(int argc, char** argv) {
     CudaBuffer<float> dPosScoreIn(static_cast<size_t>(numPos));
     CudaBuffer<float> dPosScoreOut(static_cast<size_t>(numPos));
     CudaBuffer<unsigned int> dRoundCounts(4);
+    CudaBuffer<int> dActiveNegCount(1);
     std::vector<float> hStrong(static_cast<size_t>(nSamples), 0.0f);
     std::vector<float> posScores(static_cast<size_t>(numPos), 0.0f);
     std::vector<float> hWeightsDbg;
@@ -1078,18 +1090,13 @@ int runTrain(int argc, char** argv) {
 
         std::memcpy(trainRaw.data(), selectedPosRaw.data(), selectedPosRaw.size());
         std::memcpy(trainRaw.data() + selectedPosRaw.size(), selectedNegRaw.data(), selectedNegRaw.size());
-        for (int i = numPos; i < nSamples; ++i) {
-            hActive[static_cast<size_t>(i)] = 1;
-        }
+        std::fill(hActive.begin(), hActive.end(), 1);
 
         if (cudaMemcpy(dTrain.data(),
                        trainRaw.data(),
                        trainRaw.size(),
                        cudaMemcpyHostToDevice) != cudaSuccess ||
-            cudaMemcpy(dActive.data(),
-                       hActive.data(),
-                       static_cast<size_t>(nSamples) * sizeof(uint8_t),
-                       cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaMemset(dActive.data(), 1, static_cast<size_t>(nSamples) * sizeof(uint8_t)) != cudaSuccess) {
             std::cerr << "[ERR] copy stage train set to device failed\n";
             return 1;
         }
@@ -1101,12 +1108,7 @@ int runTrain(int argc, char** argv) {
             return 1;
         }
 
-        std::vector<int> incomingNegIdx;
-        incomingNegIdx.reserve(static_cast<size_t>(numNeg));
-        for (int i = numPos; i < nSamples; ++i) {
-            if (hActive[i] != 0) incomingNegIdx.push_back(i);
-        }
-        const int stageNegBaseCount = static_cast<int>(incomingNegIdx.size());
+        const int stageNegBaseCount = numNeg;
         if (stageNegBaseCount <= 0) {
             std::cout << "[TRAIN] No surviving negatives, stop at stage " << stageIdx << "\n";
             break;
@@ -1404,14 +1406,14 @@ int runTrain(int argc, char** argv) {
                 float negMin = std::numeric_limits<float>::infinity();
                 float negMax = -std::numeric_limits<float>::infinity();
                 double negSum = 0.0;
-                for (int idx : incomingNegIdx) {
-                    const float s = hStrong[static_cast<size_t>(idx)];
+                for (int i = numPos; i < nSamples; ++i) {
+                    const float s = hStrong[static_cast<size_t>(i)];
                     negMin = std::min(negMin, s);
                     negMax = std::max(negMax, s);
                     negSum += s;
                 }
                 const float negMean =
-                    incomingNegIdx.empty() ? 0.0f : static_cast<float>(negSum / static_cast<double>(incomingNegIdx.size()));
+                    (nSamples == numPos) ? 0.0f : static_cast<float>(negSum / static_cast<double>(nSamples - numPos));
 
                 if (cudaMemcpy(hWeightsDbg.data(),
                                dWeight.data(),
@@ -1423,7 +1425,7 @@ int runTrain(int argc, char** argv) {
                 float sumPosW = 0.0f;
                 float sumNegW = 0.0f;
                 for (int i = 0; i < numPos; ++i) sumPosW += hWeightsDbg[static_cast<size_t>(i)];
-                for (int idx : incomingNegIdx) sumNegW += hWeightsDbg[static_cast<size_t>(idx)];
+                for (int i = numPos; i < nSamples; ++i) sumNegW += hWeightsDbg[static_cast<size_t>(i)];
 
                 std::cout << "[DBG] stage=" << stageIdx
                           << " weak=" << weakRound
@@ -1467,16 +1469,20 @@ int runTrain(int argc, char** argv) {
             std::cerr << "[ERR] UpdateActiveNegByThresholdKernel launch failed\n";
             return 1;
         }
-        if (cudaMemcpy(hActive.data(), dActive.data(),
-                       static_cast<size_t>(nSamples) * sizeof(uint8_t),
-                       cudaMemcpyDeviceToHost) != cudaSuccess) {
-            std::cerr << "[ERR] copy stage active mask to host failed\n";
+        int zeroNeg = 0;
+        if (cudaMemcpy(dActiveNegCount.data(), &zeroNeg, sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
+            std::cerr << "[ERR] clear active-neg count failed\n";
             return 1;
         }
-
+        CountActiveNegKernel<<<grd, blk>>>(dActive.data(), nSamples, numPos, dActiveNegCount.data());
+        if (cudaGetLastError() != cudaSuccess) {
+            std::cerr << "[ERR] CountActiveNegKernel launch failed\n";
+            return 1;
+        }
         int remainNeg = 0;
-        for (int i = numPos; i < nSamples; ++i) {
-            if (hActive[i] != 0) ++remainNeg;
+        if (cudaMemcpy(&remainNeg, dActiveNegCount.data(), sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            std::cerr << "[ERR] copy active-neg count failed\n";
+            return 1;
         }
         const float totalFalseAlarm = static_cast<float>(remainNeg) / static_cast<float>(numNeg);
 
