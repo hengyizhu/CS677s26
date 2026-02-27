@@ -352,6 +352,57 @@ __global__ void UpdateWeightsDiscreteKernel(const float* __restrict__ resp,
     }
 }
 
+__global__ void ApplyBestWeakAndUpdateKernel(const vj::HaarFeature* __restrict__ features,
+                                             int featureIdx,
+                                             const int32_t* __restrict__ sumT,
+                                             const float* __restrict__ invNorm,
+                                             const int8_t* __restrict__ labels,
+                                             const uint8_t* __restrict__ active,
+                                             float* __restrict__ weights,
+                                             float* __restrict__ strong,
+                                             int nSamples,
+                                             float theta,
+                                             int parity,
+                                             float leftVal,
+                                             float rightVal,
+                                             float coeffC,
+                                             float* __restrict__ outResp) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= nSamples) return;
+
+    const vj::HaarFeature f = features[featureIdx];
+    const auto readSum = [&](int p) -> float {
+        return static_cast<float>(sumT[static_cast<size_t>(p) * nSamples + i]);
+    };
+
+    const float s0 = readSum(f.r0.p0) - readSum(f.r0.p1) - readSum(f.r0.p2) + readSum(f.r0.p3);
+    const float s1 = readSum(f.r1.p0) - readSum(f.r1.p1) - readSum(f.r1.p2) + readSum(f.r1.p3);
+    float resp = f.r0.w * s0 + f.r1.w * s1;
+    if (f.rectCount == 3) {
+        const float s2 = readSum(f.r2.p0) - readSum(f.r2.p1) - readSum(f.r2.p2) + readSum(f.r2.p3);
+        resp += f.r2.w * s2;
+    }
+    if (invNorm) {
+        resp *= invNorm[i];
+    }
+
+    if (outResp) {
+        outResp[i] = resp;
+    }
+
+    strong[i] += (resp < theta) ? leftVal : rightVal;
+
+    if (active && active[i] == 0) {
+        return;
+    }
+    const int pred = (parity > 0)
+                         ? ((resp < theta) ? -1 : +1)
+                         : ((resp < theta) ? +1 : -1);
+    if (pred != static_cast<int>(labels[i])) {
+        weights[i] *= expf(coeffC);
+    }
+}
+
 __global__ void NormalizeWeightsKernel(float* __restrict__ weights,
                                        int n,
                                        const float* __restrict__ sumW) {
@@ -1205,14 +1256,28 @@ int runTrain(int argc, char** argv) {
             }
             selectedWeaks.push_back(weak);
 
-            st = trainer.evaluateFeatureResponses(trainEngine.deviceFeaturePool(), bestFeature, 1);
-            if (st != Status::kOk) {
-                std::cerr << "[ERR] evaluateFeatureResponses(selected weak) failed\n";
+            const bool emitDebug = (debugEvery > 0) &&
+                                   ((weakRound % debugEvery) == 0 || weakRound == stageWeakLimit - 1);
+            ApplyBestWeakAndUpdateKernel<<<grd, blk>>>(trainEngine.deviceFeaturePool(),
+                                                       bestFeature,
+                                                       iiSet.d_sumT,
+                                                       iiSet.d_invNorm,
+                                                       dLabel.data(),
+                                                       dActive.data(),
+                                                       dWeight.data(),
+                                                       dStrong.data(),
+                                                       nSamples,
+                                                       weak.theta,
+                                                       static_cast<int>(weak.parity),
+                                                       weak.leftVal,
+                                                       weak.rightVal,
+                                                       coeffC,
+                                                       emitDebug ? trainer.responseBuffer() : nullptr);
+            if (cudaGetLastError() != cudaSuccess) {
+                std::cerr << "[ERR] ApplyBestWeakAndUpdateKernel launch failed\n";
                 return 1;
             }
 
-            const bool emitDebug = (debugEvery > 0) &&
-                                   ((weakRound % debugEvery) == 0 || weakRound == stageWeakLimit - 1);
             if (emitDebug) {
                 if (cudaMemcpy(hRespDbg.data(),
                                trainer.responseBuffer(),
@@ -1248,31 +1313,6 @@ int runTrain(int argc, char** argv) {
                           << " errN=" << errN
                           << " theta=" << weak.theta
                           << "\n";
-            }
-
-            // Incrementally build current-stage strong score on GPU.
-            AccumulateStrongScoreKernel<<<grd, blk>>>(trainer.responseBuffer(),
-                                                      dStrong.data(),
-                                                      nSamples,
-                                                      weak.theta,
-                                                      weak.leftVal,
-                                                      weak.rightVal);
-            if (cudaGetLastError() != cudaSuccess) {
-                std::cerr << "[ERR] AccumulateStrongScoreKernel launch failed\n";
-                return 1;
-            }
-
-            UpdateWeightsDiscreteKernel<<<grd, blk>>>(trainer.responseBuffer(),
-                                                      dLabel.data(),
-                                                      dActive.data(),
-                                                      dWeight.data(),
-                                                      nSamples,
-                                                      weak.theta,
-                                                      static_cast<int>(weak.parity),
-                                                      coeffC);
-            if (cudaGetLastError() != cudaSuccess) {
-                std::cerr << "[ERR] UpdateWeightsDiscreteKernel launch failed\n";
-                return 1;
             }
             if (!normalizeWeights()) {
                 std::cerr << "[ERR] normalizeWeights failed after weak update\n";
@@ -1501,7 +1541,7 @@ int runTrain(int argc, char** argv) {
 int runDetect(int argc, char** argv) {
     if (argc < 4) {
         std::cerr << "Usage: cuda_hello detect <in_model.bin> <image.pgm> <out.ppm>"
-                  << " [scaleFactor=1.25] [minNeighbors=4] [minObjectSize=24] [maxDetections=200000]\n";
+                  << " [scaleFactor=1.25] [minNeighbors=4] [minObjectSize=24] [maxDetections=200000] [benchmarkRuns=0]\n";
         return 1;
     }
 
@@ -1513,10 +1553,12 @@ int runDetect(int argc, char** argv) {
     int minNeighbors = 4;
     int minObjectSize = 24;
     int maxDetections = 200000;
+    int benchmarkRuns = 0;
     if (argc > 4) scaleFactor = std::stof(argv[4]);
     if (argc > 5) minNeighbors = std::max(1, std::stoi(argv[5]));
     if (argc > 6) minObjectSize = std::max(1, std::stoi(argv[6]));
     if (argc > 7) maxDetections = std::max(100, std::stoi(argv[7]));
+    if (argc > 8) benchmarkRuns = std::max(0, std::stoi(argv[8]));
 
     WindowSpec win{};
     std::vector<HaarFeature> hFeatures;
@@ -1566,25 +1608,93 @@ int runDetect(int argc, char** argv) {
     }
 
     std::vector<Detection> detections;
-    const auto tDetect0 = std::chrono::high_resolution_clock::now();
-    st = detectEngine.detectMultiScale(dImage.data(),
-                                       img.w,
-                                       img.h,
-                                       img.w,
-                                       scaleFactor,
-                                       minNeighbors,
-                                       minObjectSize,
-                                       maxDetections,
-                                       detections,
-                                       true);
-    if (st != Status::kOk) {
-        std::cerr << "[ERR] detectMultiScale failed: " << statusToString(st) << "\n";
-        return 1;
+    if (benchmarkRuns > 0) {
+        for (int i = 0; i < 3; ++i) {
+            st = detectEngine.detectMultiScale(dImage.data(),
+                                               img.w,
+                                               img.h,
+                                               img.w,
+                                               scaleFactor,
+                                               minNeighbors,
+                                               minObjectSize,
+                                               maxDetections,
+                                               detections,
+                                               true);
+            if (st != Status::kOk) {
+                std::cerr << "[ERR] warmup detectMultiScale failed: " << statusToString(st) << "\n";
+                return 1;
+            }
+        }
+
+        cudaEvent_t evStart = nullptr;
+        cudaEvent_t evStop = nullptr;
+        if (cudaEventCreate(&evStart) != cudaSuccess || cudaEventCreate(&evStop) != cudaSuccess) {
+            std::cerr << "[ERR] cudaEventCreate failed\n";
+            return 1;
+        }
+
+        float sumMs = 0.0f;
+        float minMs = std::numeric_limits<float>::infinity();
+        float maxMs = 0.0f;
+        for (int i = 0; i < benchmarkRuns; ++i) {
+            cudaEventRecord(evStart, nullptr);
+            st = detectEngine.detectMultiScale(dImage.data(),
+                                               img.w,
+                                               img.h,
+                                               img.w,
+                                               scaleFactor,
+                                               minNeighbors,
+                                               minObjectSize,
+                                               maxDetections,
+                                               detections,
+                                               true);
+            if (st != Status::kOk) {
+                std::cerr << "[ERR] detectMultiScale failed: " << statusToString(st) << "\n";
+                cudaEventDestroy(evStart);
+                cudaEventDestroy(evStop);
+                return 1;
+            }
+            cudaEventRecord(evStop, nullptr);
+            cudaEventSynchronize(evStop);
+            float ms = 0.0f;
+            cudaEventElapsedTime(&ms, evStart, evStop);
+            sumMs += ms;
+            minMs = std::min(minMs, ms);
+            maxMs = std::max(maxMs, ms);
+        }
+        cudaEventDestroy(evStart);
+        cudaEventDestroy(evStop);
+
+        const float avgMs = sumMs / static_cast<float>(benchmarkRuns);
+        const float avgFps = (avgMs > 0.0f) ? (1000.0f / avgMs) : 0.0f;
+        std::cout << "[DETECT_BENCH] runs=" << benchmarkRuns
+                  << " detections(last)=" << detections.size()
+                  << " avg(ms): " << avgMs
+                  << " min(ms): " << minMs
+                  << " max(ms): " << maxMs
+                  << " avg(fps): " << avgFps
+                  << "\n";
+    } else {
+        const auto tDetect0 = std::chrono::high_resolution_clock::now();
+        st = detectEngine.detectMultiScale(dImage.data(),
+                                           img.w,
+                                           img.h,
+                                           img.w,
+                                           scaleFactor,
+                                           minNeighbors,
+                                           minObjectSize,
+                                           maxDetections,
+                                           detections,
+                                           true);
+        if (st != Status::kOk) {
+            std::cerr << "[ERR] detectMultiScale failed: " << statusToString(st) << "\n";
+            return 1;
+        }
+        const auto tDetect1 = std::chrono::high_resolution_clock::now();
+        const double detectMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(tDetect1 - tDetect0).count();
+        std::cout << "[DETECT] detections=" << detections.size() << " elapsed(ms): " << detectMs << "\n";
     }
-    const auto tDetect1 = std::chrono::high_resolution_clock::now();
-    const double detectMs =
-        std::chrono::duration_cast<std::chrono::milliseconds>(tDetect1 - tDetect0).count();
-    std::cout << "[DETECT] detections=" << detections.size() << " elapsed(ms): " << detectMs << "\n";
 
     std::vector<uint8_t> rgb(static_cast<size_t>(img.w) * img.h * 3);
     for (int y = 0; y < img.h; ++y) {

@@ -1308,14 +1308,35 @@ std::vector<Detection> FaceVisionEngine::groupRectanglesCpu(const std::vector<De
 
     // Secondary suppression as in OpenCV: remove small rectangles inside larger ones.
     std::vector<Detection> out;
+    int maxClusterW = 0;
+    for (const Detection& d : clustered) {
+        maxClusterW = std::max(maxClusterW, d.w);
+    }
+    std::vector<int> clusteredOrder(clustered.size(), 0);
+    for (size_t i = 0; i < clustered.size(); ++i) clusteredOrder[i] = static_cast<int>(i);
+    std::sort(clusteredOrder.begin(), clusteredOrder.end(), [&](int a, int b) {
+        if (clustered[static_cast<size_t>(a)].x != clustered[static_cast<size_t>(b)].x) {
+            return clustered[static_cast<size_t>(a)].x < clustered[static_cast<size_t>(b)].x;
+        }
+        return a < b;
+    });
+
     for (size_t i = 0; i < clustered.size(); ++i) {
         const Detection& r1 = clustered[i];
         const int n1 = ccounts[i];
         bool discard = false;
-        for (size_t j = 0; j < clustered.size(); ++j) {
-            if (i == j) continue;
-            const Detection& r2 = clustered[j];
-            const int n2 = ccounts[j];
+        const float leftBound = static_cast<float>(r1.x + r1.w) - (1.0f + eps) * static_cast<float>(maxClusterW);
+        const float rightBound = static_cast<float>(r1.x) + eps * static_cast<float>(maxClusterW);
+        for (int ord : clusteredOrder) {
+            const Detection& r2 = clustered[static_cast<size_t>(ord)];
+            if (r2.x < static_cast<int>(leftBound)) {
+                continue;
+            }
+            if (r2.x > static_cast<int>(rightBound)) {
+                break;
+            }
+            if (static_cast<size_t>(ord) == i) continue;
+            const int n2 = ccounts[static_cast<size_t>(ord)];
 
             const int dx = static_cast<int>(r2.w * eps);
             const int dy = static_cast<int>(r2.h * eps);
