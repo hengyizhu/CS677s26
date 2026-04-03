@@ -15,22 +15,45 @@
 namespace vj {
 namespace {
 
+// 这个文件负责“检测侧”的核心能力：
+// 1) 把灰度图批量转成积分图；
+// 2) 生成/上传 Haar 特征池；
+// 3) 把训练好的级联模型转成适合 GPU 检测的布局；
+// 4) 做多尺度滑窗检测，最后在 CPU 上做分组/NMS。
+//
+// 训练和检测都依赖积分图，但检测阶段更强调低延迟，
+// 所以这里做了很多布局优化来减少随机访存的代价。
 constexpr int kScanThreads = 256;
 constexpr int kNormThreads = 256;
 
 inline int divUpHost(int a, int b) {
+    // 通用的向上取整除法，用来计算 grid 维度。
     return (a + b - 1) / b;
 }
 
 template <typename T>
 __device__ __forceinline__ T ldgRead(const T* p) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 350)
+    // 对只读数据尽量走只读缓存路径，减轻普通 global memory load 压力。
     return __ldg(p);
 #else
     return *p;
 #endif
 }
 
+// 输入:
+//   d_gray: 原始灰度图批次，布局近似为 [sample][row][col]。
+//   imageW / imageH / imageStride: 单张图尺寸。
+//   nSamples: 样本数。
+//   d_rowPrefix / d_rowPrefixSq: 行前缀和输出缓冲区。
+//   rowStride: 输出行跨度，一般等于 maxImageW + 1。
+//
+// 输出:
+//   对每个样本、每一行，分别写出普通像素值和平方像素值的行前缀和。
+//
+// 并行映射:
+//   一个 block 处理一张图中的一整行；
+//   block 内线程并行扫描该行不同列位置。
 template <int BLOCK_THREADS>
 __global__ void RowPrefixKernel(const uint8_t* __restrict__ d_gray,
                                 int imageW,
@@ -66,6 +89,8 @@ __global__ void RowPrefixKernel(const uint8_t* __restrict__ d_gray,
     }
     __syncthreads();
 
+    // 每个 block 负责“一张样本图里的某一行”。
+    // 对一行做前缀和最自然，因为这一行在内存里本来就是连续的。
     // 每个 tile 处理一段连续像素，先做行方向扫描，再叠加 tile 的 carry。
     for (int base = 0; base < imageW; base += BLOCK_THREADS) {
         const int x = base + tid;
@@ -87,6 +112,7 @@ __global__ void RowPrefixKernel(const uint8_t* __restrict__ d_gray,
         }
         __syncthreads();
 
+        // 同时维护平方和积分图，后面做方差归一化时要用。
         const int pixSq = pix * pix;
         int scanSq = 0;
         int blockAggSq = 0;
@@ -103,6 +129,19 @@ __global__ void RowPrefixKernel(const uint8_t* __restrict__ d_gray,
     }
 }
 
+// 输入:
+//   d_rowPrefix / d_rowPrefixSq: 第一步得到的行前缀和。
+//   imageW / imageH / nSamples / rowStride: 当前批次图像信息。
+//
+// 输出:
+//   d_sumT / d_sqsumT: 真正的积分图和平方积分图，布局为 [iiPixel][sample]。
+//
+// 并行映射:
+//   blockIdx.y 固定一列 x；
+//   blockIdx.x * blockDim.x + threadIdx.x 对应 sample。
+//
+// 优化点:
+//   在做列前缀和的同时完成“转置写回”，避免额外单独转置一次。
 __global__ void ColumnScanTransposeKernel(const int32_t* __restrict__ d_rowPrefix,
                                           const int32_t* __restrict__ d_rowPrefixSq,
                                           int imageW,
@@ -112,6 +151,7 @@ __global__ void ColumnScanTransposeKernel(const int32_t* __restrict__ d_rowPrefi
                                           int32_t* __restrict__ d_sumT,
                                           int32_t* __restrict__ d_sqsumT) {
     // 线程 x 维度走 sample，保证写 dOut[pixel*N + sample] 时 sample 连续，合并写。
+    // 这一步不仅完成列方向前缀和，还顺便把布局转成 [iiPixel][sample]。
     const int sample = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     const int x = static_cast<int>(blockIdx.y);
 
@@ -130,6 +170,7 @@ __global__ void ColumnScanTransposeKernel(const int32_t* __restrict__ d_rowPrefi
     }
 
     // 列扫描 + 转置写回: dOut[pixel_idx * N + sample_idx]
+    // 这样后面同一个 Haar 角点偏移 p 被一整个 warp 访问时，sample 维是连续的。
     for (int y = 1; y <= imageH; ++y) {
         const size_t rowIdx = (static_cast<size_t>(sample) * imageH + (y - 1)) * rowStride + x;
         colSum += d_rowPrefix[rowIdx];
@@ -141,6 +182,9 @@ __global__ void ColumnScanTransposeKernel(const int32_t* __restrict__ d_rowPrefi
     }
 }
 
+// 单样本特化版本。
+// 输入/输出与通用列扫描一致，但省掉了 sample 维相关索引逻辑。
+// 这么做的意义是：检测时大多数场景一次只处理 1 张图，走专门 kernel 更轻量。
 __global__ void ColumnScanTransposeSingleSampleKernel(const int32_t* __restrict__ d_rowPrefix,
                                                       const int32_t* __restrict__ d_rowPrefixSq,
                                                       int imageW,
@@ -169,6 +213,16 @@ __global__ void ColumnScanTransposeSingleSampleKernel(const int32_t* __restrict_
     }
 }
 
+// 输入:
+//   d_sumT / d_sqsumT: 转置积分图和平方积分图。
+//   nSamples: 样本数。
+//   iiWidth / iiHeight: 积分图尺寸。
+//
+// 输出:
+//   d_invNorm[sample] = 1 / sqrt(area * sqsum - sum^2)。
+//
+// 作用:
+//   训练阶段使用它对 Haar 响应做方差归一化，让不同亮度/对比度样本更可比。
 __global__ void ComputeInvNormKernel(const int32_t* __restrict__ d_sumT,
                                      const int32_t* __restrict__ d_sqsumT,
                                      int nSamples,
@@ -185,6 +239,9 @@ __global__ void ComputeInvNormKernel(const int32_t* __restrict__ d_sumT,
         return;
     }
 
+    // 这里沿用 Viola-Jones / OpenCV 的做法：
+    // 不直接在整个窗口上归一化，而是对内部去掉 1 像素边界的区域求统计量。
+    // 这样能减少边界噪声和 padding 对归一化的影响。
     const int x = 1;
     const int y = 1;
     const int w = iiWidth - 3;
@@ -206,10 +263,20 @@ __global__ void ComputeInvNormKernel(const int32_t* __restrict__ d_sumT,
     const double s = readSum(p0) - readSum(p1) - readSum(p2) + readSum(p3);
     const double sq = readSq(p0) - readSq(p1) - readSq(p2) + readSq(p3);
 
+    // nf2 本质上对应 area^2 * variance，开根号后取倒数就是标准化因子。
     const double nf2 = static_cast<double>(area) * sq - s * s;
     d_invNorm[sample] = (nf2 > 1e-12) ? static_cast<float>(1.0 / std::sqrt(nf2)) : 0.0f;
 }
 
+// 输入:
+//   d_src: 源灰度图。
+//   srcW / srcH / srcStride: 源图尺寸。
+//   d_dst: 目标图缓冲区。
+//   dstW / dstH / dstStride: 目标图尺寸。
+//   scaleX / scaleY: 从目标像素映射回源图的缩放比例。
+//
+// 输出:
+//   双线性插值后的缩小图，用于构建图像金字塔。
 __global__ void ResizeBilinearKernel(const uint8_t* __restrict__ d_src,
                                      int srcW,
                                      int srcH,
@@ -226,7 +293,8 @@ __global__ void ResizeBilinearKernel(const uint8_t* __restrict__ d_src,
         return;
     }
 
-    // Match OpenCV resize geometry: map destination pixel centers to source space.
+    // 双线性插值用于构建图像金字塔。
+    // 这里刻意匹配 OpenCV 的像素中心几何，保证训练/检测与常见参考实现尽量一致。
     const float fx = (static_cast<float>(x) + 0.5f) * scaleX - 0.5f;
     const float fy = (static_cast<float>(y) + 0.5f) * scaleY - 0.5f;
 
@@ -249,6 +317,16 @@ __global__ void ResizeBilinearKernel(const uint8_t* __restrict__ d_src,
     d_dst[y * dstStride + x] = static_cast<uint8_t>(fminf(fmaxf(val + 0.5f, 0.0f), 255.0f));
 }
 
+// 输入:
+//   d_features: 当前模型真正用到的特征子集。
+//   featureCount: 特征数。
+//   modelIIWidth: 模型窗口对应积分图宽度。
+//
+// 输出:
+//   多组 dx/dy/weight 查找表，以及 rectCount。
+//
+// 作用:
+//   把 HaarFeature 中“压成一维积分图下标”的角点，预解码成检测时可直接用的偏移表。
 __global__ void BuildFeatureLUTKernel(const HaarFeature* __restrict__ d_features,
                                       int featureCount,
                                       int modelIIWidth,
@@ -285,6 +363,9 @@ __global__ void BuildFeatureLUTKernel(const HaarFeature* __restrict__ d_features
         return;
     }
 
+    // 检测时一个 stump 会被成千上万次重复访问。
+    // 提前把积分图里的 p0/p1/p2/p3 解码成 (dx, dy) LUT，
+    // 可以省掉检测 kernel 里重复做除法和取模。
     const HaarFeature f = d_features[idx];
     auto decode = [&](int p, int32_t& dx, int32_t& dy) {
         const int py = p / modelIIWidth;
@@ -314,6 +395,27 @@ __global__ void BuildFeatureLUTKernel(const HaarFeature* __restrict__ d_features
     dRectCount[idx] = f.rectCount;
 }
 
+// 输入:
+//   d_sumT / d_sqsumT: 当前尺度层的积分图和平方积分图。
+//   iiWidth / iiHeight: 该尺度层积分图尺寸。
+//   dR*Dx* / dR*Dy* / dR*W / dRectCount: 预解码后的特征 LUT。
+//   d_stumps / d_stages: 训练好的 cascade 模型。
+//   stageCount: stage 数量。
+//   winW / winH: 基础检测窗口大小。
+//   scaleIdx / scale: 当前金字塔层信息。
+//   step: 当前尺度层的滑窗步长。
+//
+// 输出:
+//   所有通过 cascade 的窗口被写入 d_out，数量通过 d_count 累加。
+//
+// 并行映射:
+//   一个线程对应一个滑窗位置。
+//
+// 核心优化:
+//   1) 先做低纹理窗口过滤；
+//   2) 逐 stage early rejection；
+//   3) 预解码 LUT 减少整数解码；
+//   4) block 内先局部统计，再做一次全局 atomicAdd。
 __global__ __launch_bounds__(256, 2) void DetectCascadeKernel(const int32_t* __restrict__ d_sumT,
                                                                const int32_t* __restrict__ d_sqsumT,
                                                                int iiWidth,
@@ -357,6 +459,8 @@ __global__ __launch_bounds__(256, 2) void DetectCascadeKernel(const int32_t* __r
                                                                Detection* __restrict__ d_out,
                                                                int* __restrict__ d_count,
                                                                int maxOut) {
+    // 一个线程对应一个滑窗位置。
+    // step>1 时表示在大尺度层上做跳步扫描，以速度换一点点候选密度。
     const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) * step;
     const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y) * step;
     const int tid = static_cast<int>(threadIdx.y * blockDim.x + threadIdx.x);
@@ -386,6 +490,7 @@ __global__ __launch_bounds__(256, 2) void DetectCascadeKernel(const int32_t* __r
     bool pass = false;
     float lastStageScore = 0.0f;
     if (inRange) {
+        // 先做窗口归一化统计。这个代价很低，却能直接过滤掉大量“纹理几乎没有”的窗口。
         const double normSum = static_cast<double>(readII(base + np0) - readII(base + np1) - readII(base + np2) + readII(base + np3));
         const uint32_t normSqU =
             readSqU32(base + np0) - readSqU32(base + np1) - readSqU32(base + np2) + readSqU32(base + np3);
@@ -396,12 +501,15 @@ __global__ __launch_bounds__(256, 2) void DetectCascadeKernel(const int32_t* __r
             // Match OpenCV HaarEvaluator::setWindow gate for low-texture windows.
             if (static_cast<double>(narea) * static_cast<double>(invNorm) < 1e-1) {
                 pass = true;
-                // Cascade early rejection: once one stage fails, this window is rejected.
+                // 级联分类器的关键优化：
+                // 一旦某一 stage 失败，后面的 stage 就没必要算了，直接早退。
                 for (int si = 0; si < stageCount; ++si) {
                     const CascadeStage st = d_stages[si];
                     float stageSum = 0.0f;
 
                     for (int wi = 0; wi < st.ntrees; ++wi) {
+                        // 一个 stump 被压成 float4：
+                        // x 存 featureIdx 的 bit 表示，y 是 theta，z/w 是左右叶子分数。
                         const float4 s = ldgRead(&(d_stumps[st.first + wi].st));
                         const int featureIdx = __float_as_int(s.x);
                         const float theta = s.y;
@@ -434,7 +542,8 @@ __global__ __launch_bounds__(256, 2) void DetectCascadeKernel(const int32_t* __r
                             raw += v2;
                         }
 
-                        // Keep decision numerically identical to training: compare normalized response.
+                        // 训练时比较的是归一化后的特征响应；检测时必须保持完全同构，
+                        // 否则训练出的阈值 theta 就会失效。
                         stageSum += (raw * invNorm < theta) ? leftVal : rightVal;
                     }
 
@@ -448,6 +557,7 @@ __global__ __launch_bounds__(256, 2) void DetectCascadeKernel(const int32_t* __r
         }
     }
 
+    // 用 block 内共享计数先做一次局部聚合，减少全局 atomicAdd 次数。
     __shared__ int sCount;
     __shared__ int sBase;
     if (tid == 0) {
@@ -482,18 +592,6 @@ __global__ __launch_bounds__(256, 2) void DetectCascadeKernel(const int32_t* __r
     }
 }
 
-inline float iou(const Detection& a, const Detection& b) {
-    const int x1 = max(a.x, b.x);
-    const int y1 = max(a.y, b.y);
-    const int x2 = min(a.x + a.w, b.x + b.w);
-    const int y2 = min(a.y + a.h, b.y + b.h);
-    const int iw = max(0, x2 - x1);
-    const int ih = max(0, y2 - y1);
-    const float inter = static_cast<float>(iw * ih);
-    const float uni = static_cast<float>(a.w * a.h + b.w * b.h) - inter;
-    return uni > 0.0f ? inter / uni : 0.0f;
-}
-
 struct DisjointSet {
     std::vector<int> p;
     std::vector<int> r;
@@ -502,6 +600,7 @@ struct DisjointSet {
         for (int i = 0; i < n; ++i) p[i] = i;
     }
     int find(int x) {
+        // 路径压缩，降低后续 find 的均摊复杂度。
         if (p[x] != x) p[x] = find(p[x]);
         return p[x];
     }
@@ -509,6 +608,7 @@ struct DisjointSet {
         a = find(a);
         b = find(b);
         if (a == b) return;
+        // 按秩合并，避免树退化成链表。
         if (r[a] < r[b]) std::swap(a, b);
         p[b] = a;
         if (r[a] == r[b]) ++r[a];
@@ -516,6 +616,7 @@ struct DisjointSet {
 };
 
 inline bool similarRects(const Detection& a, const Detection& b, float eps) {
+    // 近似判断两个检测框是否属于同一目标，逻辑和 OpenCV groupRectangles 接近。
     const int delta = static_cast<int>(
         eps * (std::min(a.w, b.w) + std::min(a.h, b.h)) * 0.5f);
     return std::abs(a.x - b.x) <= delta &&
@@ -527,12 +628,13 @@ inline bool similarRects(const Detection& a, const Detection& b, float eps) {
 inline FastRect makeFastRect(int x, int y, int w, int h, int iiWidth, float weight, bool tilted) {
     FastRect fr{};
     if (!tilted) {
+        // 非旋转特征直接记录矩形四角在积分图中的下标。
         fr.p0 = x + iiWidth * y;
         fr.p1 = (x + w) + iiWidth * y;
         fr.p2 = x + iiWidth * (y + h);
         fr.p3 = (x + w) + iiWidth * (y + h);
     } else {
-        // Same as CV_TILTED_OFFSETS
+        // 旋转 45 度的积分图偏移规则，与 OpenCV 的 CV_TILTED_OFFSETS 对齐。
         fr.p0 = x + iiWidth * y;
         fr.p1 = (x - h) + iiWidth * (y + h);
         fr.p2 = (x + w) + iiWidth * (y + w);
@@ -545,6 +647,7 @@ inline FastRect makeFastRect(int x, int y, int w, int h, int iiWidth, float weig
 } // namespace
 
 Status FaceVisionEngine::fromCuda(cudaError_t err) {
+    // 统一把 CUDA 返回码折叠成项目内部 Status。
     return err == cudaSuccess ? Status::kOk : Status::kCudaError;
 }
 
@@ -560,6 +663,13 @@ FaceVisionEngine::FaceVisionEngine(const WindowSpec& win,
       maxImageH_(maxImageH),
       enableTilted_(enableTilted),
       maxDetections_(maxDetections) {
+    // 这个类同时承担“训练时的积分图构建器”和“检测时的推理引擎”角色，
+    // 所以构造函数会把两侧会用到的大缓冲区一次性准备好。
+    //
+    // 输入:
+    //   maxSamples 决定训练批处理容量；
+    //   maxImageW / maxImageH 决定积分图与金字塔缓冲区上限；
+    //   maxDetections 决定检测结果缓冲区上限。
     if (maxSamples_ <= 0 || maxImageW_ <= 0 || maxImageH_ <= 0 || maxDetections_ <= 0) {
         throw std::invalid_argument("FaceVisionEngine: invalid constructor args");
     }
@@ -576,6 +686,8 @@ FaceVisionEngine::FaceVisionEngine(const WindowSpec& win,
     };
 
     try {
+        // dRowPrefix_ / dRowPrefixSq_ 保存中间行前缀和；
+        // dSumT_ / dSqsumT_ 保存最终转置积分图。
         alloc_or_throw(reinterpret_cast<void**>(&dRowPrefix_), rowElems * sizeof(int32_t),
                        "FaceVisionEngine: cudaMalloc dRowPrefix_ failed");
         alloc_or_throw(reinterpret_cast<void**>(&dRowPrefixSq_), rowElems * sizeof(int32_t),
@@ -598,6 +710,7 @@ FaceVisionEngine::FaceVisionEngine(const WindowSpec& win,
         alloc_or_throw(reinterpret_cast<void**>(&dDetectCount_), sizeof(int),
                        "FaceVisionEngine: cudaMalloc dDetectCount_ failed");
 
+        // 检测结果回传用 pinned host memory，减少 D2H 拷贝和同步等待开销。
         if (cudaMallocHost(reinterpret_cast<void**>(&hDetectPinned_),
                            static_cast<size_t>(maxDetections_) * sizeof(Detection)) != cudaSuccess) {
             throw std::runtime_error("FaceVisionEngine: cudaMallocHost hDetectPinned_ failed");
@@ -622,6 +735,7 @@ FaceVisionEngine::FaceVisionEngine(const WindowSpec& win,
 }
 
 FaceVisionEngine::~FaceVisionEngine() {
+    // 这里资源很多，但模式很清晰：显存、页锁定内存、模型 LUT 都在析构里统一回收。
     for (int r = 0; r < kLutRects; ++r) {
         for (int c = 0; c < kLutCorners; ++c) {
             if (dLutDx_[r][c]) cudaFree(dLutDx_[r][c]);
@@ -648,10 +762,16 @@ FaceVisionEngine::~FaceVisionEngine() {
 }
 
 FaceVisionEngine::FaceVisionEngine(FaceVisionEngine&& other) noexcept {
+    // 复用 move 赋值逻辑，避免重复代码。
     *this = std::move(other);
 }
 
 FaceVisionEngine& FaceVisionEngine::operator=(FaceVisionEngine&& other) noexcept {
+    // 输入:
+    //   other: 被移动的源对象。
+    //
+    // 输出:
+    //   当前对象接管 other 的全部资源；other 被清空成安全可析构状态。
     if (this == &other) {
         return *this;
     }
@@ -765,10 +885,20 @@ FaceVisionEngine& FaceVisionEngine::operator=(FaceVisionEngine&& other) noexcept
 }
 
 int FaceVisionEngine::countHaarFeatures(const WindowSpec& win, FeatureMode mode) {
+    // 直接复用 buildHaarFeaturePool 的枚举逻辑，保证计数口径绝对一致。
     return static_cast<int>(buildHaarFeaturePool(win, mode).size());
 }
 
 std::vector<HaarFeature> FaceVisionEngine::buildHaarFeaturePool(const WindowSpec& win, FeatureMode mode) {
+    // 输入:
+    //   win: 基础窗口大小。
+    //   mode: 控制特征池规模与是否包含 tilted 特征。
+    //
+    // 输出:
+    //   host 侧完整 Haar 特征池。
+    //
+    // 核心思路:
+    //   穷举窗口内所有合法位置、尺寸和模板类型，生成可训练的候选特征集合。
     std::vector<HaarFeature> out;
     const int W = win.winW;
     const int H = win.winH;
@@ -776,8 +906,11 @@ std::vector<HaarFeature> FaceVisionEngine::buildHaarFeaturePool(const WindowSpec
     const bool corePlus = mode != FeatureMode::Basic;
     const bool withTilted = mode == FeatureMode::All;
 
+    // 提前 reserve 是个很实用的小优化：
+    // Haar 特征池规模很大，如果不预留空间，push_back 过程中会反复扩容和搬数据。
     out.reserve(180000);
 
+    // 两矩形模板和三矩形模板分别封装成小 lambda，减少重复样板代码。
     auto push2 = [&](bool tilted,
                      int x0, int y0, int w0, int h0, float wt0,
                      int x1, int y1, int w1, int h1, float wt1) {
@@ -806,6 +939,7 @@ std::vector<HaarFeature> FaceVisionEngine::buildHaarFeaturePool(const WindowSpec
     };
 
     // 与 OpenCV traincascade 逻辑一致：遍历位置、尺寸、模板类型。
+    // 这里本质上是在枚举“24x24 检测窗里所有可能的 Haar 模板”。
     for (int x = 0; x < W; ++x) {
         for (int y = 0; y < H; ++y) {
             for (int dx = 1; dx <= W; ++dx) {
@@ -896,11 +1030,17 @@ std::vector<HaarFeature> FaceVisionEngine::buildHaarFeaturePool(const WindowSpec
 }
 
 Status FaceVisionEngine::uploadFeaturePool(const std::vector<HaarFeature>& hFeatures, cudaStream_t stream) {
+    // 输入:
+    //   hFeatures: host 侧 Haar 特征池。
+    //
+    // 输出:
+    //   dFeaturePool_ 被更新，featurePoolSize_ 记录新大小。
     if (hFeatures.empty()) {
         return Status::kInvalidArg;
     }
 
     if (dFeaturePool_) {
+        // 特征池允许重传，所以先释放旧池子再申请新的。
         cudaFree(dFeaturePool_);
         dFeaturePool_ = nullptr;
         featurePoolSize_ = 0;
@@ -912,6 +1052,7 @@ Status FaceVisionEngine::uploadFeaturePool(const std::vector<HaarFeature>& hFeat
         return fromCuda(st);
     }
 
+    // 特征池是只读数据，上传一次后训练/检测可反复复用。
     st = cudaMemcpyAsync(dFeaturePool_, hFeatures.data(), bytes, cudaMemcpyHostToDevice, stream);
     if (st != cudaSuccess) {
         cudaFree(dFeaturePool_);
@@ -930,6 +1071,18 @@ Status FaceVisionEngine::computeIntegralBatchTransposed(const uint8_t* dGrayBatc
                                                         int nSamples,
                                                         bool computeInvNorm,
                                                         cudaStream_t stream) {
+    // 这是训练和检测都会频繁调用的基础算子：
+    // 输入灰度图/图像批，输出转置布局的积分图和平方积分图。
+    //
+    // 输入:
+    //   dGrayBatch: 原始灰度图批次。
+    //   imageW / imageH / imageStride: 单张图参数。
+    //   nSamples: 样本数。
+    //   computeInvNorm: 是否计算 invNorm。
+    //
+    // 输出:
+    //   currentImageW_/H_/Samples_ 更新；
+    //   dSumT_ / dSqsumT_ / dInvNorm_ 被写入。
     if (!dGrayBatch || imageW <= 0 || imageH <= 0 || imageStride < imageW || nSamples <= 0) {
         return Status::kInvalidArg;
     }
@@ -944,6 +1097,7 @@ Status FaceVisionEngine::computeIntegralBatchTransposed(const uint8_t* dGrayBatc
     const int rowStride = maxImageW_ + 1;
 
     {
+        // 第 1 步：对每一行做前缀和。
         const dim3 block(kScanThreads, 1, 1);
         const dim3 grid(static_cast<unsigned>(nSamples * imageH), 1, 1);
         RowPrefixKernel<kScanThreads><<<grid, block, 0, stream>>>(dGrayBatch,
@@ -961,7 +1115,9 @@ Status FaceVisionEngine::computeIntegralBatchTransposed(const uint8_t* dGrayBatc
     }
 
     {
+        // 第 2 步：沿列继续累加，并顺手转置成后续 kernel 更友好的 [iiPixel][sample] 布局。
         if (nSamples == 1) {
+            // 单样本走专门 kernel，省掉 sample 维的通用逻辑，减少分支开销。
             const int colThreads = 256;
             const dim3 block(static_cast<unsigned>(colThreads), 1, 1);
             const dim3 grid(static_cast<unsigned>(divUpHost(imageW + 1, colThreads)), 1, 1);
@@ -994,6 +1150,8 @@ Status FaceVisionEngine::computeIntegralBatchTransposed(const uint8_t* dGrayBatc
     }
 
     if (computeInvNorm) {
+        // 第 3 步：可选地计算方差归一化因子。
+        // 训练需要它来比较不同样本上的特征响应；检测时 kernel 内可现场算，所以这里可关闭。
         const int iiWidth = imageW + 1;
         const int iiHeight = imageH + 1;
         const int normThreads = (nSamples < kNormThreads) ? nSamples : kNormThreads;
@@ -1010,7 +1168,10 @@ Status FaceVisionEngine::computeIntegralBatchTransposed(const uint8_t* dGrayBatc
 }
 
 IntegralImageSetT FaceVisionEngine::integralSetView() const noexcept {
+    // 输出:
+    //   一个只读视图对象，供训练侧直接绑定，不复制底层显存。
     IntegralImageSetT out{};
+    // 只返回轻量视图，不复制真正的大数组。
     out.nSamples = currentSamples_;
     out.iiWidth = currentImageW_ + 1;
     out.iiHeight = currentImageH_ + 1;
@@ -1028,6 +1189,17 @@ Status FaceVisionEngine::setCascadeModel(const HaarFeature* dUsedFeatures,
                                          int stumpCount,
                                          const std::vector<CascadeStage>& hStages,
                                          cudaStream_t stream) {
+    // setCascadeModel 的目标不是单纯“保存参数”，而是把模型重排成检测 kernel 最适合的结构。
+    //
+    // 输入:
+    //   dUsedFeatures: device 端已筛选特征子集。
+    //   usedFeatureCount: 特征数。
+    //   dStumps: device 端紧凑 stump 数组。
+    //   stumpCount: stump 数量。
+    //   hStages: host 端 stage 描述。
+    //
+    // 输出:
+    //   dModelFeatures_ / dModelStumps_ / dModelStages_ 与 LUT 被刷新。
     if (!dUsedFeatures || !dStumps || hStages.empty() || usedFeatureCount <= 0 || stumpCount <= 0) {
         return Status::kInvalidArg;
     }
@@ -1037,6 +1209,7 @@ Status FaceVisionEngine::setCascadeModel(const HaarFeature* dUsedFeatures,
             return cudaErrorInvalidValue;
         }
         if (*ptr && capacityCount >= neededCount) {
+            // 容量够就直接复用，避免重复申请释放显存。
             return cudaSuccess;
         }
         if (*ptr) {
@@ -1079,6 +1252,8 @@ Status FaceVisionEngine::setCascadeModel(const HaarFeature* dUsedFeatures,
         return fromCuda(st);
     }
     if (modelLutCapacity_ < usedFeatureCount) {
+        // LUT 容量不够时整套重建。
+        // 代价换收益：检测 kernel 里不用再做 point 解码和权重拆分。
         for (int r = 0; r < kLutRects; ++r) {
             for (int c = 0; c < kLutCorners; ++c) {
                 if (dLutDx_[r][c]) {
@@ -1127,6 +1302,7 @@ Status FaceVisionEngine::setCascadeModel(const HaarFeature* dUsedFeatures,
         modelLutCapacity_ = usedFeatureCount;
     }
 
+    // 先把原始模型参数拷入 engine 内部，后续检测阶段就不依赖外部缓冲区生命周期。
     st = cudaMemcpyAsync(dModelFeatures_, dUsedFeatures,
                          static_cast<size_t>(usedFeatureCount) * sizeof(HaarFeature),
                          cudaMemcpyDeviceToDevice, stream);
@@ -1152,6 +1328,7 @@ Status FaceVisionEngine::setCascadeModel(const HaarFeature* dUsedFeatures,
     }
 
     {
+        // 把 HaarFeature 中的积分图角点下标解码成 dx/dy 查找表。
         const dim3 block(256, 1, 1);
         const dim3 grid(static_cast<unsigned>((usedFeatureCount + 255) / 256), 1, 1);
         BuildFeatureLUTKernel<<<grid, block, 0, stream>>>(dModelFeatures_,
@@ -1187,6 +1364,8 @@ Status FaceVisionEngine::setCascadeModel(const HaarFeature* dUsedFeatures,
 }
 
 Status FaceVisionEngine::clearCascadeModel(cudaStream_t) {
+    // 清掉当前上传的模型，但保留基础积分图/金字塔缓冲区；
+    // 这样同一个 engine 可以反复加载不同模型。
     if (dModelStages_) {
         cudaFree(dModelStages_);
         dModelStages_ = nullptr;
@@ -1232,6 +1411,13 @@ Status FaceVisionEngine::clearCascadeModel(cudaStream_t) {
 std::vector<Detection> FaceVisionEngine::groupRectanglesCpu(const std::vector<Detection>& in,
                                                             int minNeighbors,
                                                             float eps) const {
+    // 输入:
+    //   in: 原始候选框列表。
+    //   minNeighbors: 一个簇至少需要多少个邻居才保留。
+    //   eps: 相似框判定容忍度。
+    //
+    // 输出:
+    //   聚类、平均、二次抑制后的最终检测框列表。
     if (in.empty()) {
         return {};
     }
@@ -1239,7 +1425,10 @@ std::vector<Detection> FaceVisionEngine::groupRectanglesCpu(const std::vector<De
     const int n = static_cast<int>(in.size());
     DisjointSet dsu(n);
 
-    // Sweep-line candidate pruning on x to reduce pair checks while keeping exact similarRects test.
+    // 这里不是简单 IoU-NMS，而是尽量贴近 OpenCV groupRectangles：
+    // 先把“足够相似”的框并进一个集合，再对集合求均值框。
+    //
+    // 为了减少 O(N^2) 两两比较成本，先按 x 排序，并利用 sweep-line 提前截断。
     std::vector<int> order(static_cast<size_t>(n), 0);
     for (int i = 0; i < n; ++i) order[static_cast<size_t>(i)] = i;
     std::sort(order.begin(), order.end(), [&](int a, int b) {
@@ -1265,6 +1454,7 @@ std::vector<Detection> FaceVisionEngine::groupRectanglesCpu(const std::vector<De
         }
     }
 
+    // 下面这些累加器用于把一个连通分量里的多个框平均成一个代表框。
     std::vector<int64_t> sumX(n, 0), sumY(n, 0), sumW(n, 0), sumH(n, 0);
     std::vector<int> count(n, 0);
     std::vector<float> bestScore(n, -std::numeric_limits<float>::infinity());
@@ -1307,7 +1497,8 @@ std::vector<Detection> FaceVisionEngine::groupRectanglesCpu(const std::vector<De
         ccounts.push_back(count[i]);
     }
 
-    // Secondary suppression as in OpenCV: remove small rectangles inside larger ones.
+    // 第二轮抑制同样模仿 OpenCV：
+    // 如果一个小框被更大、更稳定（邻居更多）的框包住，就把小框丢掉。
     std::vector<Detection> out;
     int maxClusterW = 0;
     for (const Detection& d : clustered) {
@@ -1368,8 +1559,22 @@ Status FaceVisionEngine::detectMultiScale(const uint8_t* dImageGray,
                                           std::vector<Detection>& outDetections,
                                           bool applyGrouping,
                                           cudaStream_t stream) {
+    // 输入:
+    //   dImageGray: 一张待检测灰度图。
+    //   scaleFactor: 金字塔缩放比例。
+    //   minNeighbors: 后处理分组参数。
+    //   minObjectSize: 忽略过小目标。
+    //   maxDetections: 本次调用允许输出的最大候选数。
+    //   applyGrouping: 是否把原始候选框进一步聚类成最终框。
+    //
+    // 输出:
+    //   outDetections: 最终输出框。
+    //
+    // 主流程:
+    //   图像金字塔 -> 每层积分图 -> 每层滑窗 cascade -> 回传候选 -> 可选分组。
     outDetections.clear();
 
+    // 检测前必须先通过 setCascadeModel 上传模型，否则 kernel 没有可用的 cascade 参数。
     if (!dImageGray || imageW <= 0 || imageH <= 0 || imageStride < imageW ||
         scaleFactor <= 1.0f || minObjectSize < 1) {
         return Status::kInvalidArg;
@@ -1390,6 +1595,7 @@ Status FaceVisionEngine::detectMultiScale(const uint8_t* dImageGray,
         }
     }
 
+    // 经典图像金字塔：不断把图缩小，让固定大小的检测窗去覆盖不同尺寸的人脸。
     float scale = 1.0f;
     int scaleIdx = 0;
     const uint8_t* dPrevScaled = dImageGray;
@@ -1419,6 +1625,7 @@ Status FaceVisionEngine::detectMultiScale(const uint8_t* dImageGray,
         int scaledStride = 0;
 
         if (scaleIdx == 0) {
+            // 第一层直接复用原图，不做额外拷贝。
             dScaled = dImageGray;
             scaledStride = imageStride;
         } else {
@@ -1429,6 +1636,8 @@ Status FaceVisionEngine::detectMultiScale(const uint8_t* dImageGray,
             const dim3 grid(static_cast<unsigned>(divUpHost(scaledW, 16)),
                             static_cast<unsigned>(divUpHost(scaledH, 16)),
                             1);
+            // 这里不是每层都从原图重采样，而是从上一层继续缩小。
+            // 好处是更省算力和带宽；代价是会累积一点插值误差，但对检测任务通常可以接受。
             const float resizeX = static_cast<float>(prevW) / static_cast<float>(scaledW);
             const float resizeY = static_cast<float>(prevH) / static_cast<float>(scaledH);
             ResizeBilinearKernel<<<grid, block, 0, stream>>>(dPrevScaled,
@@ -1459,12 +1668,15 @@ Status FaceVisionEngine::detectMultiScale(const uint8_t* dImageGray,
         const int workW = scaledW - win_.winW + 1;
         const int workH = scaledH - win_.winH + 1;
         // Scale-aware jump scanning: progressively skip more positions at large scales.
+        // 原因很直接：尺度越大，窗口物理尺寸越大，相邻位置之间高度重叠，
+        // 没必要像小尺度那样逐像素滑动。
         const int step = (scale >= 3.0f) ? 3 : ((scale >= 2.0f) ? 2 : 1);
         const int scanW = divUpHost(workW, step);
         const int scanH = divUpHost(workH, step);
 
         if (scanW > 0 && scanH > 0) {
-            // Keep x dimension at warp width to improve memory coalescing on integral reads.
+            // block.x 取 32，刻意对齐一个 warp，
+            // 因为窗口之间主要沿 x 方向相邻，积分图读取更容易合并。
             const dim3 block(32, 8, 1);
             const dim3 grid(static_cast<unsigned>(divUpHost(scanW, 32)),
                             static_cast<unsigned>(divUpHost(scanH, 8)),
@@ -1511,6 +1723,7 @@ Status FaceVisionEngine::detectMultiScale(const uint8_t* dImageGray,
         ++scaleIdx;
     }
 
+    // 先回传命中个数，再按真实数量回传 Detection 数组，避免无意义拷贝整块大缓冲区。
     cudaError_t stc = cudaMemcpyAsync(hDetectCountPinned_, dDetectCount_, sizeof(int), cudaMemcpyDeviceToHost, stream);
     if (stc != cudaSuccess) {
         return fromCuda(stc);
@@ -1535,6 +1748,7 @@ Status FaceVisionEngine::detectMultiScale(const uint8_t* dImageGray,
     }
 
     if (applyGrouping) {
+        // 默认输出更接近“最终检测框”，而不是所有原始滑窗命中。
         outDetections = groupRectanglesCpu(allDetections, minNeighbors, 0.2f);
     } else {
         outDetections.swap(allDetections);

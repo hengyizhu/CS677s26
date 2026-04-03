@@ -25,10 +25,19 @@
 
 namespace {
 
+// main.cu 不是单纯的程序入口，它实际上承担了 4 类职责：
+// 1) 提供训练 / 检测 / CPU-GPU 对照实验的命令行入口；
+// 2) 放一些宿主端辅助函数，例如 PGM/PPM 读写、裁剪、画框；
+// 3) 放训练阶段只在本文件里使用的小型 CUDA kernel；
+// 4) 串起完整的 cascade 训练流程，包括 hard negative mining。
+//
+// 之所以把很多逻辑集中在这里，是因为课程项目更看重“流程跑通 + 方便演示”，
+// 而不是把所有东西拆成非常细的工程模块。
 using vj::AdaBoostTrainer;
 using vj::CascadeStage;
 using vj::Detection;
 using vj::FaceVisionEngine;
+using vj::FastRect;
 using vj::FeatureTileView;
 using vj::GpuStump4;
 using vj::HaarFeature;
@@ -44,8 +53,10 @@ template <typename T>
 class CudaBuffer {
 public:
     CudaBuffer() = default;
+    // 构造时允许直接按元素个数申请显存，方便写临时工作缓冲区。
     explicit CudaBuffer(size_t count) { allocate(count); }
     ~CudaBuffer() {
+        // RAII：对象析构时自动释放显存，避免 main 里写一大堆 cudaFree。
         if (ptr_) cudaFree(ptr_);
     }
 
@@ -67,6 +78,8 @@ public:
     }
 
     bool allocate(size_t count) {
+        // 这个封装走的是“重新分配即先释放旧内存”的简单策略，
+        // 优点是行为清晰；项目里也足够用了。
         if (ptr_) {
             cudaFree(ptr_);
             ptr_ = nullptr;
@@ -90,10 +103,12 @@ private:
 struct GrayImage {
     int w = 0;
     int h = 0;
+    // 灰度图按行优先存放，每个像素 1 字节。
     std::vector<uint8_t> data;
 };
 
 std::string statusToString(Status s) {
+    // 把内部枚举转成人能看懂的字符串，便于命令行调试。
     switch (s) {
         case Status::kOk: return "kOk";
         case Status::kInvalidArg: return "kInvalidArg";
@@ -108,6 +123,16 @@ bool loadRawSampleBin(const std::string& path,
                       int samplePixels,
                       std::vector<uint8_t>& out,
                       int& outCount) {
+    // 训练样本文件是“很多个 24x24 patch 直接首尾拼接”的二进制格式。
+    // 这样读取速度快，也比逐张图片解析简单得多。
+    //
+    // 输入:
+    //   path: 样本文件路径。
+    //   samplePixels: 单个样本包含多少个像素，通常是 24*24。
+    //
+    // 输出:
+    //   out: 读出的原始字节流。
+    //   outCount: 样本数量。
     std::ifstream ifs(path, std::ios::binary);
     if (!ifs) {
         std::cerr << "[ERR] Cannot open: " << path << "\n";
@@ -122,6 +147,7 @@ bool loadRawSampleBin(const std::string& path,
         return false;
     }
     if (sz % samplePixels != 0) {
+        // 如果文件大小不能整除单样本像素数，说明样本文件格式不对或损坏了。
         std::cerr << "[ERR] File size is not divisible by samplePixels: " << path << "\n";
         return false;
     }
@@ -136,6 +162,8 @@ bool loadRawSampleBin(const std::string& path,
 }
 
 std::string shellQuote(const std::string& s) {
+    // 这里手写单引号转义，是为了把路径安全地塞进 system() 调用的 shell 命令里。
+    // 否则路径里只要有空格或单引号，就可能执行失败甚至产生注入风险。
     std::string out;
     out.reserve(s.size() + 8);
     out.push_back('\'');
@@ -159,6 +187,17 @@ bool regenerateStageNegativesFromCache(const std::string& scriptPath,
                                        int winSize,
                                        int seed,
                                        std::string& outBinPath) {
+    // 每个 stage 都动态重采负样本，这比“全程固定一份负样本集”更贴近
+    // 经典级联训练里逐层挖 hard negatives 的思路。
+    //
+    // 输入:
+    //   scriptPath: 外部 Python 采样脚本。
+    //   cacheDir / imagesDir / outDir: 负样本缓存与输出目录。
+    //   stageIdx / numNeg / winSize / seed: 本 stage 的采样参数。
+    //
+    // 输出:
+    //   outBinPath: 生成的负样本 bin 文件路径。
+    //   返回值: 脚本是否执行成功。
     std::ostringstream binName;
     binName << "non_faces_stage";
     if (stageIdx < 10) {
@@ -179,11 +218,14 @@ bool regenerateStageNegativesFromCache(const std::string& scriptPath,
         << " --images-dir " << shellQuote(imagesDir)
         << " --out-dir " << shellQuote(outDir);
 
+    // 这里直接复用外部 Python 脚本处理缓存、采样、落盘，
+    // 避免把图像数据准备逻辑重复写一遍 C++ 版本。
     const int rc = std::system(cmd.str().c_str());
     return rc == 0;
 }
 
 std::vector<std::string> collectPgmPaths(const std::string& rootDir) {
+    // 递归收集一个目录下所有 PGM 文件，供 hard negative mining 遍历大图时使用。
     std::vector<std::string> out;
     namespace fs = std::filesystem;
     std::error_code ec;
@@ -201,6 +243,15 @@ std::vector<std::string> collectPgmPaths(const std::string& rootDir) {
 }
 
 void cropResizeTo24(const GrayImage& img, const Detection& d, std::vector<uint8_t>& out24) {
+    // hard negative mining 得到的框尺寸不一定正好 24x24，
+    // 所以要裁剪后再 resize 回训练窗口大小。
+    //
+    // 输入:
+    //   img: 原始负样本大图。
+    //   d: 当前检测到的候选框。
+    //
+    // 输出:
+    //   out24: 裁剪并缩放后的 24x24 patch，可直接作为新的负样本。
     const int outW = 24;
     const int outH = 24;
     out24.resize(static_cast<size_t>(outW) * outH);
@@ -210,6 +261,7 @@ void cropResizeTo24(const GrayImage& img, const Detection& d, std::vector<uint8_
 
     for (int oy = 0; oy < outH; ++oy) {
         for (int ox = 0; ox < outW; ++ox) {
+            // 与检测金字塔一致，使用像素中心对齐的双线性插值。
             const float srcFx = static_cast<float>(d.x) + (static_cast<float>(ox) + 0.5f) * (sx / outW) - 0.5f;
             const float srcFy = static_cast<float>(d.y) + (static_cast<float>(oy) + 0.5f) * (sy / outH) - 0.5f;
             const int x0 = std::clamp(static_cast<int>(std::floor(srcFx)), 0, img.w - 1);
@@ -232,10 +284,19 @@ void cropResizeTo24(const GrayImage& img, const Detection& d, std::vector<uint8_
 }
 
 bool nextToken(std::istream& is, std::string& tok) {
+    // 输入:
+    //   is: PGM 文件流。
+    //
+    // 输出:
+    //   tok: 读取到的下一个非注释、非空白 token。
+    //
+    // 作用:
+    //   PGM 头部解析辅助函数，负责跳过注释行和任意空白。
     tok.clear();
     while (is.good()) {
         char c = static_cast<char>(is.peek());
         if (c == '#') {
+            // PGM 头允许出现注释行，所以这里要显式跳过。
             std::string line;
             std::getline(is, line);
             continue;
@@ -252,6 +313,13 @@ bool nextToken(std::istream& is, std::string& tok) {
 }
 
 bool loadPGM(const std::string& path, GrayImage& img) {
+    // 只支持二进制 P5 PGM，因为这是最简单、最稳定的灰度输入格式。
+    //
+    // 输入:
+    //   path: 输入灰度图路径。
+    //
+    // 输出:
+    //   img: 解析后的宽、高和像素数组。
     std::ifstream ifs(path, std::ios::binary);
     if (!ifs) {
         std::cerr << "[ERR] Cannot open PGM: " << path << "\n";
@@ -274,7 +342,7 @@ bool loadPGM(const std::string& path, GrayImage& img) {
         return false;
     }
 
-    // Skip one whitespace before raw bytes
+    // 读完 PGM 头以后，还会有一个分隔空白字符，需要吃掉再读原始像素。
     ifs.get();
 
     img.data.resize(static_cast<size_t>(img.w) * img.h);
@@ -286,6 +354,12 @@ bool loadPGM(const std::string& path, GrayImage& img) {
 }
 
 bool savePPM(const std::string& path, int w, int h, const std::vector<uint8_t>& rgb) {
+    // 用 PPM 输出结果图的好处是完全不依赖额外图像库。
+    //
+    // 输入:
+    //   path: 输出路径。
+    //   w / h: 图像尺寸。
+    //   rgb: 长度为 w*h*3 的 RGB 字节数组。
     std::ofstream ofs(path, std::ios::binary);
     if (!ofs) {
         std::cerr << "[ERR] Cannot write PPM: " << path << "\n";
@@ -297,6 +371,14 @@ bool savePPM(const std::string& path, int w, int h, const std::vector<uint8_t>& 
 }
 
 void drawRect(std::vector<uint8_t>& rgb, int w, int h, const Detection& d) {
+    // 画 2 像素宽白框，只是为了演示结果直观，不参与任何算法。
+    //
+    // 输入:
+    //   rgb: 目标 RGB 图像。
+    //   d: 要绘制的检测框。
+    //
+    // 输出:
+    //   直接原地修改 rgb。
     const int x0 = std::max(0, d.x);
     const int y0 = std::max(0, d.y);
     const int x1 = std::min(w - 1, d.x + d.w - 1);
@@ -327,29 +409,421 @@ void drawRect(std::vector<uint8_t>& rgb, int w, int h, const Detection& d) {
     }
 }
 
-__global__ void UpdateWeightsDiscreteKernel(const float* __restrict__ resp,
-                                            const int8_t* __restrict__ labels,
-                                            const uint8_t* __restrict__ active,
-                                            float* __restrict__ weights,
-                                            int n,
-                                            float theta,
-                                            int parity,
-                                            float coeffC) {
-    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (i >= n) return;
+struct HostIntegralImage {
+    int iiW = 0;
+    int iiH = 0;
+    std::vector<int32_t> sum;
+    std::vector<int32_t> sqsum;
+    // invNorm = 1 / sqrt(area * sqsum - sum^2)，用于特征响应归一化。
+    float invNorm = 1.0f;
+};
 
-    if (active && active[i] == 0) {
-        return;
+struct CpuBestWeakResult {
+    int featureIdx = -1;
+    float err = std::numeric_limits<float>::infinity();
+    float theta = 0.0f;
+    int parity = +1;
+};
+
+HostIntegralImage buildHostIntegralImage(const uint8_t* gray, int w, int h, int stride, bool computeInvNorm) {
+    HostIntegralImage out{};
+    out.iiW = w + 1;
+    out.iiH = h + 1;
+    out.sum.assign(static_cast<size_t>(out.iiW) * out.iiH, 0);
+    out.sqsum.assign(static_cast<size_t>(out.iiW) * out.iiH, 0);
+
+    // 输入:
+    //   gray: 原始灰度图像素。
+    //   w / h / stride: 图像尺寸与步长。
+    //   computeInvNorm: 是否同时计算 invNorm。
+    //
+    // 输出:
+    //   host 端积分图、平方积分图和可选归一化因子。
+    //
+    // 宿主端版本的积分图，主要用于 CPU 参考实现和对照实验。
+    for (int y = 1; y <= h; ++y) {
+        int rowSum = 0;
+        int rowSqSum = 0;
+        for (int x = 1; x <= w; ++x) {
+            const int pix = static_cast<int>(gray[static_cast<size_t>(y - 1) * stride + (x - 1)]);
+            rowSum += pix;
+            rowSqSum += pix * pix;
+            const size_t idx = static_cast<size_t>(y) * out.iiW + x;
+            out.sum[idx] = out.sum[idx - out.iiW] + rowSum;
+            out.sqsum[idx] = out.sqsum[idx - out.iiW] + rowSqSum;
+        }
     }
 
-    const float r = resp[i];
-    const int pred = (parity > 0)
-                         ? ((r < theta) ? -1 : +1)
-                         : ((r < theta) ? +1 : -1);
-
-    if (pred != static_cast<int>(labels[i])) {
-        weights[i] *= expf(coeffC);
+    if (computeInvNorm && out.iiW >= 3 && out.iiH >= 3) {
+        // 归一化逻辑和 GPU 版保持一致，保证 CPU/GPU 对照时口径统一。
+        const int x = 1;
+        const int y = 1;
+        const int ww = out.iiW - 3;
+        const int hh = out.iiH - 3;
+        const int area = ww * hh;
+        const int p0 = x + out.iiW * y;
+        const int p1 = (x + ww) + out.iiW * y;
+        const int p2 = x + out.iiW * (y + hh);
+        const int p3 = (x + ww) + out.iiW * (y + hh);
+        const double s = static_cast<double>(out.sum[p0] - out.sum[p1] - out.sum[p2] + out.sum[p3]);
+        const double sq = static_cast<double>(out.sqsum[p0] - out.sqsum[p1] - out.sqsum[p2] + out.sqsum[p3]);
+        const double nf2 = static_cast<double>(area) * sq - s * s;
+        out.invNorm = (nf2 > 1e-12) ? static_cast<float>(1.0 / std::sqrt(nf2)) : 0.0f;
     }
+    return out;
+}
+
+inline float evalTrainingFeatureHost(const HaarFeature& f, const HostIntegralImage& ii) {
+    // CPU 版 Haar 响应计算，用来校验 GPU 训练核心是否正确。
+    //
+    // 输入:
+    //   f: 一个 Haar 特征。
+    //   ii: 一张样本图的积分图表示。
+    //
+    // 输出:
+    //   该特征在该样本上的归一化响应值。
+    const auto readSum = [&](int p) -> float {
+        return static_cast<float>(ii.sum[static_cast<size_t>(p)]);
+    };
+    const float s0 = readSum(f.r0.p0) - readSum(f.r0.p1) - readSum(f.r0.p2) + readSum(f.r0.p3);
+    const float s1 = readSum(f.r1.p0) - readSum(f.r1.p1) - readSum(f.r1.p2) + readSum(f.r1.p3);
+    float resp = f.r0.w * s0 + f.r1.w * s1;
+    if (f.rectCount == 3) {
+        const float s2 = readSum(f.r2.p0) - readSum(f.r2.p1) - readSum(f.r2.p2) + readSum(f.r2.p3);
+        resp += f.r2.w * s2;
+    }
+    return resp * ii.invNorm;
+}
+
+inline void decodeModelPoint(int p, int modelIIWidth, int& dx, int& dy) {
+    // 模型里把积分图坐标压成一维下标，检测时需要再还原成 (dx, dy)。
+    dy = p / modelIIWidth;
+    dx = p - dy * modelIIWidth;
+}
+
+inline float evalDetectionFeatureHost(const HaarFeature& f,
+                                      const std::vector<int32_t>& sum,
+                                      int iiWidth,
+                                      int base,
+                                      int modelIIWidth,
+                                      float invNorm) {
+    // CPU 检测参考版：和 GPU detect kernel 做同样的事情，只是慢很多。
+    //
+    // 输入:
+    //   f: 一个 Haar 特征。
+    //   sum: 普通积分图。
+    //   iiWidth: 当前图像积分图宽度。
+    //   base: 当前滑窗左上角在积分图中的基址。
+    //   modelIIWidth: 模型窗口积分图宽度。
+    //   invNorm: 当前窗口归一化因子。
+    //
+    // 输出:
+    //   该特征在当前滑窗上的归一化响应值。
+    auto rectVal = [&](const FastRect& r) -> float {
+        int dx0 = 0, dy0 = 0, dx1 = 0, dy1 = 0, dx2 = 0, dy2 = 0, dx3 = 0, dy3 = 0;
+        decodeModelPoint(r.p0, modelIIWidth, dx0, dy0);
+        decodeModelPoint(r.p1, modelIIWidth, dx1, dy1);
+        decodeModelPoint(r.p2, modelIIWidth, dx2, dy2);
+        decodeModelPoint(r.p3, modelIIWidth, dx3, dy3);
+        const int p0 = base + dy0 * iiWidth + dx0;
+        const int p1 = base + dy1 * iiWidth + dx1;
+        const int p2 = base + dy2 * iiWidth + dx2;
+        const int p3 = base + dy3 * iiWidth + dx3;
+        return (static_cast<float>(sum[static_cast<size_t>(p0)]) -
+                static_cast<float>(sum[static_cast<size_t>(p1)]) -
+                static_cast<float>(sum[static_cast<size_t>(p2)]) +
+                static_cast<float>(sum[static_cast<size_t>(p3)])) * r.w;
+    };
+
+    float raw = rectVal(f.r0) + rectVal(f.r1);
+    if (f.rectCount == 3) {
+        raw += rectVal(f.r2);
+    }
+    return raw * invNorm;
+}
+
+std::vector<uint8_t> resizeGrayBilinearHost(const uint8_t* src,
+                                            int srcW,
+                                            int srcH,
+                                            int srcStride,
+                                            int dstW,
+                                            int dstH) {
+    // CPU 金字塔缩放参考实现，主要供 detect_compare 使用。
+    //
+    // 输入:
+    //   src: 源灰度图。
+    //   srcW / srcH / srcStride: 源图尺寸。
+    //   dstW / dstH: 目标图尺寸。
+    //
+    // 输出:
+    //   双线性插值后的目标灰度图。
+    std::vector<uint8_t> dst(static_cast<size_t>(dstW) * dstH, 0);
+    const float scaleX = static_cast<float>(srcW) / static_cast<float>(dstW);
+    const float scaleY = static_cast<float>(srcH) / static_cast<float>(dstH);
+    for (int y = 0; y < dstH; ++y) {
+        for (int x = 0; x < dstW; ++x) {
+            const float fx = (static_cast<float>(x) + 0.5f) * scaleX - 0.5f;
+            const float fy = (static_cast<float>(y) + 0.5f) * scaleY - 0.5f;
+            const int sx0 = std::max(0, std::min(static_cast<int>(std::floor(fx)), srcW - 1));
+            const int sy0 = std::max(0, std::min(static_cast<int>(std::floor(fy)), srcH - 1));
+            const int sx1 = std::min(sx0 + 1, srcW - 1);
+            const int sy1 = std::min(sy0 + 1, srcH - 1);
+            const float ax = fx - static_cast<float>(sx0);
+            const float ay = fy - static_cast<float>(sy0);
+            const float p00 = static_cast<float>(src[static_cast<size_t>(sy0) * srcStride + sx0]);
+            const float p01 = static_cast<float>(src[static_cast<size_t>(sy0) * srcStride + sx1]);
+            const float p10 = static_cast<float>(src[static_cast<size_t>(sy1) * srcStride + sx0]);
+            const float p11 = static_cast<float>(src[static_cast<size_t>(sy1) * srcStride + sx1]);
+            const float top = p00 + (p01 - p00) * ax;
+            const float bot = p10 + (p11 - p10) * ax;
+            const float val = top + (bot - top) * ay;
+            dst[static_cast<size_t>(y) * dstW + x] =
+                static_cast<uint8_t>(std::clamp(static_cast<int>(val + 0.5f), 0, 255));
+        }
+    }
+    return dst;
+}
+
+CpuBestWeakResult runCpuWeakSearch(const std::vector<HaarFeature>& features,
+                                   int featureLimit,
+                                   const std::vector<HostIntegralImage>& samples,
+                                   const std::vector<int8_t>& labels,
+                                   const std::vector<uint8_t>& active,
+                                   const std::vector<float>& weights) {
+    // 纯 CPU 暴力版“找最佳弱分类器”，主要用于和 GPU 核心做 correctness / speed 对比。
+    //
+    // 输入:
+    //   features: 全量 Haar 特征池。
+    //   featureLimit: 只搜索前多少个特征。
+    //   samples: 每个样本的 host 端积分图。
+    //   labels / active / weights: AdaBoost 当前轮状态。
+    //
+    // 输出:
+    //   CpuBestWeakResult: 全局最佳特征、阈值、parity 和加权误差。
+    CpuBestWeakResult best{};
+    if (samples.empty() || labels.size() != samples.size() || weights.size() != samples.size()) {
+        return best;
+    }
+
+    const int nSamples = static_cast<int>(samples.size());
+    std::vector<float> resp(static_cast<size_t>(nSamples), 0.0f);
+    std::vector<uint16_t> order(static_cast<size_t>(nSamples), 0);
+
+    for (int featureIdx = 0; featureIdx < featureLimit; ++featureIdx) {
+        for (int i = 0; i < nSamples; ++i) {
+            resp[static_cast<size_t>(i)] = evalTrainingFeatureHost(features[static_cast<size_t>(featureIdx)], samples[static_cast<size_t>(i)]);
+            order[static_cast<size_t>(i)] = static_cast<uint16_t>(i);
+        }
+        // 先按响应排序，再扫描阈值；这是 stump 训练的标准做法。
+        std::stable_sort(order.begin(), order.end(), [&](uint16_t a, uint16_t b) {
+            const float va = resp[static_cast<size_t>(a)];
+            const float vb = resp[static_cast<size_t>(b)];
+            if (va < vb) return true;
+            if (va > vb) return false;
+            return a < b;
+        });
+
+        float totalPos = 0.0f;
+        float totalNeg = 0.0f;
+        for (int k = 0; k < nSamples; ++k) {
+            const int si = static_cast<int>(order[static_cast<size_t>(k)]);
+            if (!active.empty() && active[static_cast<size_t>(si)] == 0) continue;
+            if (labels[static_cast<size_t>(si)] > 0) {
+                totalPos += weights[static_cast<size_t>(si)];
+            } else {
+                totalNeg += weights[static_cast<size_t>(si)];
+            }
+        }
+
+        float leftPos = 0.0f;
+        float leftNeg = 0.0f;
+        for (int k = 0; k < nSamples - 1; ++k) {
+            const int si = static_cast<int>(order[static_cast<size_t>(k)]);
+            if (active.empty() || active[static_cast<size_t>(si)] != 0) {
+                if (labels[static_cast<size_t>(si)] > 0) {
+                    leftPos += weights[static_cast<size_t>(si)];
+                } else {
+                    leftNeg += weights[static_cast<size_t>(si)];
+                }
+            }
+
+            const int si0 = static_cast<int>(order[static_cast<size_t>(k)]);
+            const int si1 = static_cast<int>(order[static_cast<size_t>(k + 1)]);
+            const float v0 = resp[static_cast<size_t>(si0)];
+            const float v1 = resp[static_cast<size_t>(si1)];
+            if (!(v0 + 1e-7f < v1)) continue;
+
+            const float rightPos = totalPos - leftPos;
+            const float rightNeg = totalNeg - leftNeg;
+
+            const float errLeftPos = leftNeg + rightPos;
+            if (errLeftPos < best.err ||
+                (errLeftPos == best.err &&
+                 (featureIdx < best.featureIdx || (featureIdx == best.featureIdx && -1 > best.parity)))) {
+                best.featureIdx = featureIdx;
+                best.err = errLeftPos;
+                best.theta = 0.5f * (v0 + v1);
+                best.parity = -1;
+            }
+
+            const float errLeftNeg = leftPos + rightNeg;
+            if (errLeftNeg < best.err ||
+                (errLeftNeg == best.err &&
+                 (featureIdx < best.featureIdx || (featureIdx == best.featureIdx && +1 > best.parity)))) {
+                best.featureIdx = featureIdx;
+                best.err = errLeftNeg;
+                best.theta = 0.5f * (v0 + v1);
+                best.parity = +1;
+            }
+        }
+    }
+
+    return best;
+}
+
+std::vector<Detection> detectMultiScaleCpu(const std::vector<HaarFeature>& features,
+                                           const std::vector<GpuStump4>& stumps,
+                                           const std::vector<CascadeStage>& stages,
+                                           const WindowSpec& win,
+                                           const uint8_t* image,
+                                           int imageW,
+                                           int imageH,
+                                           int imageStride,
+                                           float scaleFactor,
+                                           int minObjectSize,
+                                           int maxDetections,
+                                           int maxScales) {
+    // 纯 CPU 检测参考实现：
+    // 逻辑尽量与 GPU 版保持一致，这样 detect_compare 才能说明“加速而不是改算法”。
+    //
+    // 输入:
+    //   features / stumps / stages: 已训练模型。
+    //   image / imageW / imageH / imageStride: 输入灰度图。
+    //   scaleFactor / minObjectSize / maxDetections / maxScales: 检测参数。
+    //
+    // 输出:
+    //   原始检测框列表，不做 grouping。
+    std::vector<Detection> out;
+    const int modelIIWidth = win.winW + 1;
+
+    float scale = 1.0f;
+    int scaleIdx = 0;
+    std::vector<uint8_t> prevScaled;
+    const uint8_t* prevPtr = image;
+    int prevW = imageW;
+    int prevH = imageH;
+    int prevStride = imageStride;
+
+    while (true) {
+        if (maxScales > 0 && scaleIdx >= maxScales) break;
+        const int scaledW = static_cast<int>(std::round(static_cast<float>(imageW) / scale));
+        const int scaledH = static_cast<int>(std::round(static_cast<float>(imageH) / scale));
+        const int objW = static_cast<int>(std::round(static_cast<float>(win.winW) * scale));
+        const int objH = static_cast<int>(std::round(static_cast<float>(win.winH) * scale));
+
+        if (scaledW < win.winW || scaledH < win.winH) break;
+        if (objW < minObjectSize || objH < minObjectSize) {
+            scale *= scaleFactor;
+            ++scaleIdx;
+            continue;
+        }
+
+        std::vector<uint8_t> scaledBuf;
+        const uint8_t* scaledPtr = nullptr;
+        int scaledStride = 0;
+        if (scaleIdx == 0) {
+            scaledPtr = image;
+            scaledStride = imageStride;
+        } else {
+            // 与 GPU 版一样，后续尺度层从上一层继续缩小。
+            scaledBuf = resizeGrayBilinearHost(prevPtr, prevW, prevH, prevStride, scaledW, scaledH);
+            scaledPtr = scaledBuf.data();
+            scaledStride = scaledW;
+            prevScaled = scaledBuf;
+            prevPtr = prevScaled.data();
+            prevW = scaledW;
+            prevH = scaledH;
+            prevStride = scaledStride;
+        }
+
+        const HostIntegralImage ii = buildHostIntegralImage(scaledPtr, scaledW, scaledH, scaledStride, false);
+        const int workW = scaledW - win.winW + 1;
+        const int workH = scaledH - win.winH + 1;
+        // 大尺度层采用更大的步长扫描，降低计算量。
+        const int step = (scale >= 3.0f) ? 3 : ((scale >= 2.0f) ? 2 : 1);
+
+        const int nx = 1;
+        const int ny = 1;
+        const int nw = win.winW - 2;
+        const int nh = win.winH - 2;
+        const int narea = nw * nh;
+        const int np0 = nx + ii.iiW * ny;
+        const int np1 = (nx + nw) + ii.iiW * ny;
+        const int np2 = nx + ii.iiW * (ny + nh);
+        const int np3 = (nx + nw) + ii.iiW * (ny + nh);
+
+        for (int y = 0; y < workH; y += step) {
+            for (int x = 0; x < workW; x += step) {
+                const int base = y * ii.iiW + x;
+                const double normSum = static_cast<double>(ii.sum[static_cast<size_t>(base + np0)] -
+                                                           ii.sum[static_cast<size_t>(base + np1)] -
+                                                           ii.sum[static_cast<size_t>(base + np2)] +
+                                                           ii.sum[static_cast<size_t>(base + np3)]);
+                const uint32_t normSqU =
+                    static_cast<uint32_t>(ii.sqsum[static_cast<size_t>(base + np0)]) -
+                    static_cast<uint32_t>(ii.sqsum[static_cast<size_t>(base + np1)]) -
+                    static_cast<uint32_t>(ii.sqsum[static_cast<size_t>(base + np2)]) +
+                    static_cast<uint32_t>(ii.sqsum[static_cast<size_t>(base + np3)]);
+                const double nf2 = static_cast<double>(narea) * static_cast<double>(normSqU) - normSum * normSum;
+                if (!(nf2 > 0.0)) continue;
+                const float invNorm = static_cast<float>(1.0 / std::sqrt(nf2));
+                if (!(static_cast<double>(narea) * static_cast<double>(invNorm) < 1e-1)) continue;
+
+                // 逐 stage early reject，是级联检测能快起来的关键。
+                bool pass = true;
+                float lastStageScore = 0.0f;
+                for (const CascadeStage& stage : stages) {
+                    float stageSum = 0.0f;
+                    for (int wi = 0; wi < stage.ntrees; ++wi) {
+                        const float4 s = stumps[static_cast<size_t>(stage.first + wi)].st;
+                        int featureIdx = 0;
+                        std::memcpy(&featureIdx, &s.x, sizeof(int));
+                        const float resp = evalDetectionFeatureHost(features[static_cast<size_t>(featureIdx)],
+                                                                    ii.sum,
+                                                                    ii.iiW,
+                                                                    base,
+                                                                    modelIIWidth,
+                                                                    invNorm);
+                        stageSum += (resp < s.y) ? s.z : s.w;
+                    }
+                    if (stageSum < stage.threshold) {
+                        pass = false;
+                        break;
+                    }
+                    lastStageScore = stageSum;
+                }
+
+                if (pass) {
+                    Detection d{};
+                    d.x = static_cast<int>(x * scale + 0.5f);
+                    d.y = static_cast<int>(y * scale + 0.5f);
+                    d.w = static_cast<int>(win.winW * scale + 0.5f);
+                    d.h = static_cast<int>(win.winH * scale + 0.5f);
+                    d.scaleIdx = scaleIdx;
+                    d.score = lastStageScore;
+                    out.push_back(d);
+                    if (static_cast<int>(out.size()) >= maxDetections) {
+                        return out;
+                    }
+                }
+            }
+        }
+
+        scale *= scaleFactor;
+        ++scaleIdx;
+    }
+
+    return out;
 }
 
 __global__ void ApplyBestWeakAndUpdateKernel(const vj::HaarFeature* __restrict__ features,
@@ -367,6 +841,9 @@ __global__ void ApplyBestWeakAndUpdateKernel(const vj::HaarFeature* __restrict__
                                              float rightVal,
                                              float coeffC,
                                              float* __restrict__ outResp) {
+    // 把“算最佳弱分类器在所有样本上的响应”
+    // 和“更新 strong score / 更新权重”合并进一个 kernel，
+    // 避免先写回响应、再读回来做第二次遍历。
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= nSamples) return;
 
@@ -387,9 +864,11 @@ __global__ void ApplyBestWeakAndUpdateKernel(const vj::HaarFeature* __restrict__
     }
 
     if (outResp) {
+        // 调试时可把本轮最佳特征响应导出回 host 检查。
         outResp[i] = resp;
     }
 
+    // strong score 累加的是 stump 左右叶子分值，不是简单投票数。
     strong[i] += (resp < theta) ? leftVal : rightVal;
 
     if (active && active[i] == 0) {
@@ -406,6 +885,7 @@ __global__ void ApplyBestWeakAndUpdateKernel(const vj::HaarFeature* __restrict__
 __global__ void NormalizeWeightsKernel(float* __restrict__ weights,
                                        int n,
                                        const float* __restrict__ sumW) {
+    // AdaBoost 里权重通常会重新归一化到和为 1，保证误差仍可解释成概率质量。
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= n) return;
     const float s = sumW[0];
@@ -417,6 +897,7 @@ __global__ void NormalizeWeightsKernel(float* __restrict__ weights,
 __global__ void ApplyActiveMaskToWeightsKernel(float* __restrict__ weights,
                                                const uint8_t* __restrict__ active,
                                                int n) {
+    // 被 stage 淘汰的负样本权重直接清零，后面不再参与训练。
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= n) return;
     if (active && active[i] == 0) {
@@ -430,6 +911,8 @@ __global__ void ResetStageWeightsKernel(float* __restrict__ weights,
                                         int numPos,
                                         float wPos,
                                         float wNeg) {
+    // 每个新 stage 开始前重新平衡正负样本总权重：
+    // 正样本总和 0.5，当前活跃负样本总和 0.5。
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= n) return;
     if (i < numPos) {
@@ -438,17 +921,6 @@ __global__ void ResetStageWeightsKernel(float* __restrict__ weights,
     } else {
         weights[i] = (active[i] != 0) ? wNeg : 0.0f;
     }
-}
-
-__global__ void AccumulateStrongScoreKernel(const float* __restrict__ resp,
-                                            float* __restrict__ strong,
-                                            int n,
-                                            float theta,
-                                            float leftVal,
-                                            float rightVal) {
-    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (i >= n) return;
-    strong[i] += (resp[i] < theta) ? leftVal : rightVal;
 }
 
 __global__ void ExtractPosScoresKernel(const float* __restrict__ strong,
@@ -466,6 +938,9 @@ __global__ void CountPassAndNegKernel(const float* __restrict__ strong,
                                       int numPos,
                                       float cutVal,
                                       unsigned int* __restrict__ counts4) {
+    // 一次统计四个量：
+    // posGe / posGt / negGe / negGt
+    // 这样可以同时比较阈值取 >=cut 和 >cut 两种策略。
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= nSamples) return;
 
@@ -487,6 +962,7 @@ __global__ void UpdateActiveNegByThresholdKernel(const float* __restrict__ stron
                                                  int nSamples,
                                                  int numPos,
                                                  float threshold) {
+    // 一个 stage 训练完成后，只保留没有被该 stage 拒绝的负样本作为后续 stage 的 hard negatives。
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= nSamples || i < numPos) return;
     if (active[i] != 0) {
@@ -498,6 +974,7 @@ __global__ void CountActiveNegKernel(const uint8_t* __restrict__ active,
                                      int nSamples,
                                      int numPos,
                                      int* __restrict__ outCount) {
+    // 统计当前 stage 之后还活着的负样本数，用来估计 false alarm。
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= nSamples || i < numPos) return;
     if (active[i] != 0) {
@@ -506,6 +983,7 @@ __global__ void CountActiveNegKernel(const uint8_t* __restrict__ active,
 }
 
 __global__ void FillArrayKernel(float* __restrict__ arr, int n, float v) {
+    // 自定义 fill kernel 的原因很简单：避免为了一个小操作额外引入更多依赖。
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i < n) arr[i] = v;
 }
@@ -521,6 +999,7 @@ __device__ __forceinline__ TileBestCandidate betterTileCandidate(const TileBestC
 __global__ void ReduceTileBestCandidatesKernel(const TileBestCandidate* __restrict__ in,
                                                int n,
                                                TileBestCandidate* __restrict__ out) {
+    // 每个 feature tile 已经有一个最优候选了，这里再做一层归约，得到本轮全局最优 weak。
     __shared__ TileBestCandidate s[256];
     const int tid = static_cast<int>(threadIdx.x);
     TileBestCandidate local{};
@@ -550,7 +1029,355 @@ __global__ void ReduceTileBestCandidatesKernel(const TileBestCandidate* __restri
 
 }  // namespace
 
+int runTrainCompare(int argc, char** argv) {
+    // 训练对照实验：
+    // 同一批样本、同一批 Haar 特征，同时跑 CPU 和 GPU 的“最佳弱分类器搜索”，
+    // 用来验证正确性并展示加速比。
+    //
+    // 输入:
+    //   命令行参数给出正负样本文件、样本数、特征数和重复运行次数。
+    //
+    // 输出:
+    //   在终端打印 CPU / GPU 搜索到的最佳 weak 以及平均耗时。
+    if (argc < 3) {
+        std::cerr << "Usage: cuda_hello train_compare <faces_u8.bin> <negatives_u8.bin>"
+                  << " [numPos=256] [numNeg=256] [featureLimit=1024] [runs=3]\n";
+        return 1;
+    }
+
+    const std::string posPath = argv[1];
+    const std::string negPath = argv[2];
+    const int reqNumPos = (argc > 3) ? std::max(1, std::stoi(argv[3])) : 256;
+    const int reqNumNeg = (argc > 4) ? std::max(1, std::stoi(argv[4])) : 256;
+    int featureLimit = (argc > 5) ? std::max(1, std::stoi(argv[5])) : 1024;
+    const int runs = (argc > 6) ? std::max(1, std::stoi(argv[6])) : 3;
+
+    const WindowSpec win{24, 24};
+    const int samplePixels = win.winW * win.winH;
+
+    std::vector<uint8_t> posRaw;
+    std::vector<uint8_t> negRaw;
+    int posCount = 0;
+    int negCount = 0;
+    if (!loadRawSampleBin(posPath, samplePixels, posRaw, posCount) ||
+        !loadRawSampleBin(negPath, samplePixels, negRaw, negCount)) {
+        return 1;
+    }
+
+    const int numPos = std::min(reqNumPos, posCount);
+    const int numNeg = std::min(reqNumNeg, negCount);
+    const int nSamples = numPos + numNeg;
+    if (nSamples <= 1) {
+        std::cerr << "[ERR] Need at least 2 samples for train_compare\n";
+        return 1;
+    }
+
+    // 把正样本放前面、负样本放后面，后面很多 kernel 都默认这个布局。
+    std::vector<uint8_t> trainRaw(static_cast<size_t>(nSamples) * samplePixels, 0);
+    std::memcpy(trainRaw.data(), posRaw.data(), static_cast<size_t>(numPos) * samplePixels);
+    std::memcpy(trainRaw.data() + static_cast<size_t>(numPos) * samplePixels,
+                negRaw.data(),
+                static_cast<size_t>(numNeg) * samplePixels);
+
+    std::vector<int8_t> labels(static_cast<size_t>(nSamples), -1);
+    std::vector<uint8_t> active(static_cast<size_t>(nSamples), 1);
+    std::vector<float> weights(static_cast<size_t>(nSamples), 0.0f);
+    for (int i = 0; i < numPos; ++i) {
+        labels[static_cast<size_t>(i)] = +1;
+        weights[static_cast<size_t>(i)] = 0.5f / static_cast<float>(numPos);
+    }
+    for (int i = numPos; i < nSamples; ++i) {
+        weights[static_cast<size_t>(i)] = 0.5f / static_cast<float>(numNeg);
+    }
+
+    // 对照实验只需要一个可控的 feature 子集，不一定非得把全特征池都跑完。
+    std::vector<HaarFeature> features =
+        FaceVisionEngine::buildHaarFeaturePool(win, FaceVisionEngine::FeatureMode::Core);
+    featureLimit = std::min(featureLimit, static_cast<int>(features.size()));
+
+    std::vector<HostIntegralImage> hostSamples;
+    hostSamples.reserve(static_cast<size_t>(nSamples));
+    for (int i = 0; i < nSamples; ++i) {
+        hostSamples.push_back(buildHostIntegralImage(trainRaw.data() + static_cast<size_t>(i) * samplePixels,
+                                                     win.winW,
+                                                     win.winH,
+                                                     win.winW,
+                                                     true));
+    }
+
+    CpuBestWeakResult cpuBest{};
+    double cpuMs = 0.0;
+    for (int r = 0; r < runs; ++r) {
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        cpuBest = runCpuWeakSearch(features, featureLimit, hostSamples, labels, active, weights);
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        cpuMs += static_cast<double>(
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()) / 1000.0;
+    }
+    cpuMs /= static_cast<double>(runs);
+
+    // 这里 maxDetections=1 只是因为 train_compare 不做真正检测。
+    FaceVisionEngine engine(win, nSamples, win.winW, win.winH, false, 1);
+    AdaBoostTrainer trainer(win, nSamples, featureLimit);
+    Status st = engine.uploadFeaturePool(features);
+    if (st != Status::kOk) {
+        std::cerr << "[ERR] uploadFeaturePool failed: " << statusToString(st) << "\n";
+        return 1;
+    }
+
+    CudaBuffer<uint8_t> dTrain(trainRaw.size());
+    CudaBuffer<int8_t> dLabel(static_cast<size_t>(nSamples));
+    CudaBuffer<uint8_t> dActive(static_cast<size_t>(nSamples));
+    CudaBuffer<float> dWeight(static_cast<size_t>(nSamples));
+    CudaBuffer<TileBestCandidate> dTileBest(1);
+    if (cudaMemcpy(dTrain.data(), trainRaw.data(), trainRaw.size(), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(dLabel.data(), labels.data(), static_cast<size_t>(nSamples) * sizeof(int8_t), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(dActive.data(), active.data(), static_cast<size_t>(nSamples) * sizeof(uint8_t), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(dWeight.data(), weights.data(), static_cast<size_t>(nSamples) * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
+        std::cerr << "[ERR] cudaMemcpy failed\n";
+        return 1;
+    }
+
+    st = engine.computeIntegralBatchTransposed(dTrain.data(), win.winW, win.winH, win.winW, nSamples);
+    if (st != Status::kOk) {
+        std::cerr << "[ERR] computeIntegralBatchTransposed failed: " << statusToString(st) << "\n";
+        return 1;
+    }
+
+    st = trainer.bindTrainingSet(engine.integralSetView(),
+                                 LabelsView{nSamples, dLabel.data(), dActive.data()},
+                                 WeightsView{nSamples, dWeight.data()});
+    if (st != Status::kOk) {
+        std::cerr << "[ERR] bindTrainingSet failed: " << statusToString(st) << "\n";
+        return 1;
+    }
+
+    TileBestCandidate gpuBest{};
+    float gpuMs = 0.0f;
+    cudaEvent_t evStart = nullptr;
+    cudaEvent_t evStop = nullptr;
+    cudaEventCreate(&evStart);
+    cudaEventCreate(&evStop);
+    for (int r = 0; r < runs; ++r) {
+        cudaEventRecord(evStart, nullptr);
+        // GPU 路径严格对应 CPU 的三个步骤：响应 -> 排序 -> 扫阈值 -> 选最优。
+        st = trainer.evaluateFeatureResponses(engine.deviceFeaturePool(), 0, featureLimit);
+        if (st == Status::kOk) st = trainer.sortSamplesPerFeature(trainer.responseBuffer(), featureLimit);
+        if (st == Status::kOk) {
+            FeatureTileView tile{};
+            tile.featureBegin = 0;
+            tile.featureCount = featureLimit;
+            tile.d_features = engine.deviceFeaturePool();
+            tile.d_resp = trainer.responseBuffer();
+            tile.d_sortedIdx = trainer.sortedIndexBuffer();
+            st = trainer.evaluateAndFindThreshold(tile);
+        }
+        if (st == Status::kOk) st = trainer.selectBestInTile(0, featureLimit, nullptr, dTileBest.data());
+        cudaEventRecord(evStop, nullptr);
+        cudaEventSynchronize(evStop);
+        if (st != Status::kOk) {
+            std::cerr << "[ERR] GPU benchmark failed: " << statusToString(st) << "\n";
+            cudaEventDestroy(evStart);
+            cudaEventDestroy(evStop);
+            return 1;
+        }
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, evStart, evStop);
+        gpuMs += ms;
+    }
+    gpuMs /= static_cast<float>(runs);
+    cudaMemcpy(&gpuBest, dTileBest.data(), sizeof(TileBestCandidate), cudaMemcpyDeviceToHost);
+    cudaEventDestroy(evStart);
+    cudaEventDestroy(evStop);
+
+    std::cout << "[TRAIN_COMPARE] samples=" << nSamples
+              << " numPos=" << numPos
+              << " numNeg=" << numNeg
+              << " features=" << featureLimit
+              << " runs=" << runs << "\n";
+    std::cout << "[TRAIN_COMPARE] CPU best feature=" << cpuBest.featureIdx
+              << " theta=" << cpuBest.theta
+              << " parity=" << cpuBest.parity
+              << " err=" << cpuBest.err
+              << " avg(ms)=" << cpuMs << "\n";
+    std::cout << "[TRAIN_COMPARE] GPU best feature=" << gpuBest.featureIdx
+              << " theta=" << gpuBest.bestTheta
+              << " parity=" << static_cast<int>(gpuBest.bestParity)
+              << " err=" << gpuBest.bestErr
+              << " avg(ms)=" << gpuMs << "\n";
+    if (gpuMs > 0.0f) {
+        std::cout << "[TRAIN_COMPARE] speedup=" << (cpuMs / static_cast<double>(gpuMs)) << "x\n";
+    }
+    return 0;
+}
+
+int runDetectCompare(int argc, char** argv) {
+    // 检测对照实验：
+    // 用同一个模型在 CPU/GPU 上各跑几次，比较输出规模和平均耗时。
+    //
+    // 输入:
+    //   命令行参数给出模型、输入图像、输出可视化路径和检测参数。
+    //
+    // 输出:
+    //   打印 CPU / GPU 平均耗时，并保存 GPU 检测结果图。
+    if (argc < 4) {
+        std::cerr << "Usage: cuda_hello detect_compare <in_model.bin> <image.pgm> <out.ppm>"
+                  << " [scaleFactor=1.25] [minObjectSize=24] [maxDetections=200000] [maxScales=0] [runs=3]\n";
+        return 1;
+    }
+
+    const std::string modelPath = argv[1];
+    const std::string imagePath = argv[2];
+    const std::string outPath = argv[3];
+    const float scaleFactor = (argc > 4) ? std::stof(argv[4]) : 1.25f;
+    const int minObjectSize = (argc > 5) ? std::max(1, std::stoi(argv[5])) : 24;
+    const int maxDetections = (argc > 6) ? std::max(100, std::stoi(argv[6])) : 200000;
+    const int maxScales = (argc > 7) ? std::max(0, std::stoi(argv[7])) : 0;
+    const int runs = (argc > 8) ? std::max(1, std::stoi(argv[8])) : 3;
+    if (maxScales != 0) {
+        std::cerr << "[ERR] detect_compare currently requires maxScales=0 so CPU/GPU use the same scale schedule\n";
+        return 1;
+    }
+
+    WindowSpec win{};
+    std::vector<HaarFeature> hFeatures;
+    std::vector<GpuStump4> hStumps;
+    std::vector<CascadeStage> hStages;
+    if (!vj::ModelIO::loadCascadeModel(modelPath.c_str(), win, hFeatures, hStumps, hStages)) {
+        std::cerr << "[ERR] loadCascadeModel failed: " << modelPath << "\n";
+        return 1;
+    }
+
+    GrayImage img;
+    if (!loadPGM(imagePath, img)) {
+        return 1;
+    }
+
+    std::vector<Detection> cpuDetections;
+    double cpuMs = 0.0;
+    for (int r = 0; r < runs; ++r) {
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        cpuDetections = detectMultiScaleCpu(hFeatures,
+                                            hStumps,
+                                            hStages,
+                                            win,
+                                            img.data.data(),
+                                            img.w,
+                                            img.h,
+                                            img.w,
+                                            scaleFactor,
+                                            minObjectSize,
+                                            maxDetections,
+                                            maxScales);
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        cpuMs += static_cast<double>(
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()) / 1000.0;
+    }
+    cpuMs /= static_cast<double>(runs);
+
+    // 检测时样本数恒为 1，因为输入是一张待检测图片。
+    FaceVisionEngine detectEngine(win, 1, img.w, img.h, false, maxDetections);
+    Status st = detectEngine.uploadFeaturePool(hFeatures);
+    if (st != Status::kOk) {
+        std::cerr << "[ERR] uploadFeaturePool failed: " << statusToString(st) << "\n";
+        return 1;
+    }
+
+    CudaBuffer<GpuStump4> dStumps(hStumps.size());
+    CudaBuffer<uint8_t> dImage(static_cast<size_t>(img.w) * img.h);
+    if (cudaMemcpy(dStumps.data(), hStumps.data(), hStumps.size() * sizeof(GpuStump4), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(dImage.data(), img.data.data(), static_cast<size_t>(img.w) * img.h, cudaMemcpyHostToDevice) != cudaSuccess) {
+        std::cerr << "[ERR] cudaMemcpy failed\n";
+        return 1;
+    }
+
+    st = detectEngine.setCascadeModel(detectEngine.deviceFeaturePool(),
+                                      detectEngine.featurePoolSize(),
+                                      dStumps.data(),
+                                      static_cast<int>(hStumps.size()),
+                                      hStages);
+    if (st != Status::kOk) {
+        std::cerr << "[ERR] setCascadeModel failed: " << statusToString(st) << "\n";
+        return 1;
+    }
+
+    std::vector<Detection> gpuDetections;
+    float gpuMs = 0.0f;
+    cudaEvent_t evStart = nullptr;
+    cudaEvent_t evStop = nullptr;
+    cudaEventCreate(&evStart);
+    cudaEventCreate(&evStop);
+    for (int r = 0; r < runs; ++r) {
+        cudaEventRecord(evStart, nullptr);
+        st = detectEngine.detectMultiScale(dImage.data(),
+                                           img.w,
+                                           img.h,
+                                           img.w,
+                                           scaleFactor,
+                                           0,
+                                           minObjectSize,
+                                           maxDetections,
+                                           gpuDetections,
+                                           false);
+        cudaEventRecord(evStop, nullptr);
+        cudaEventSynchronize(evStop);
+        if (st != Status::kOk) {
+            std::cerr << "[ERR] detectMultiScale failed: " << statusToString(st) << "\n";
+            cudaEventDestroy(evStart);
+            cudaEventDestroy(evStop);
+            return 1;
+        }
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, evStart, evStop);
+        gpuMs += ms;
+    }
+    gpuMs /= static_cast<float>(runs);
+    cudaEventDestroy(evStart);
+    cudaEventDestroy(evStop);
+
+    std::cout << "[DETECT_COMPARE] cpuDetections=" << cpuDetections.size()
+              << " gpuDetections=" << gpuDetections.size()
+              << " runs=" << runs
+              << " maxScales=" << maxScales << "\n";
+    std::cout << "[DETECT_COMPARE] CPU avg(ms)=" << cpuMs << "\n";
+    std::cout << "[DETECT_COMPARE] GPU avg(ms)=" << gpuMs << "\n";
+    if (gpuMs > 0.0f) {
+        std::cout << "[DETECT_COMPARE] speedup=" << (cpuMs / static_cast<double>(gpuMs)) << "x\n";
+    }
+
+    // 最后把灰度图转成 RGB，只是为了在结果上画白框。
+    std::vector<uint8_t> rgb(static_cast<size_t>(img.w) * img.h * 3);
+    for (int y = 0; y < img.h; ++y) {
+        for (int x = 0; x < img.w; ++x) {
+            const uint8_t g = img.data[static_cast<size_t>(y) * img.w + x];
+            const size_t idx = (static_cast<size_t>(y) * img.w + x) * 3;
+            rgb[idx + 0] = g;
+            rgb[idx + 1] = g;
+            rgb[idx + 2] = g;
+        }
+    }
+    for (const Detection& d : gpuDetections) {
+        drawRect(rgb, img.w, img.h, d);
+    }
+    if (!savePPM(outPath, img.w, img.h, rgb)) {
+        std::cerr << "[ERR] savePPM failed\n";
+        return 1;
+    }
+    std::cout << "[OK] Saved GPU detection visualization to: " << outPath << "\n";
+    return 0;
+}
+
 int runTrain(int argc, char** argv) {
+    // 真正的级联训练入口。
+    // 参数设计尽量贴近论文/ OpenCV traincascade 中最关键的超参数，
+    // 但为了课程项目可控，也做了一些上限和固定值约束。
+    //
+    // 输出:
+    //   训练完成后保存级联模型文件，并在终端打印每个 stage / weak 的训练统计信息。
+    //
+    // 主流程:
+    //   读正样本 -> 采负样本 -> 算积分图 -> 搜索最优 weak -> 校准 stage 阈值
+    //   -> 过滤剩余负样本 -> 重复多 stage -> 保存模型。
     constexpr int kPaperStages = 38;
     constexpr int kPaperTotalFeatures = 6061;
     constexpr int kPaperPosPerStage = 10000;
@@ -703,6 +1530,7 @@ int runTrain(int argc, char** argv) {
         maxStages = kPaperStages;
     }
 
+    // 负样本是动态重采样的，具体采样和缓存由 Python 脚本负责。
     const std::string stageNegScriptPath = "scripts/stage_negatives.py";
     const std::string stageNegOutDir = stageNegCacheDir + "/stage_negatives";
 
@@ -752,6 +1580,7 @@ int runTrain(int argc, char** argv) {
     std::vector<uint8_t> trainRaw(static_cast<size_t>(nSamples) * samplePixels, 0);
     std::vector<uint8_t> selectedPosRaw(static_cast<size_t>(numPos) * samplePixels, 0);
     auto fillStagePositives = [&](int stageSeed) {
+        // 每个 stage 都重新随机采一批正样本，避免始终盯着完全相同的子集训练。
         if (numPosPool <= numPos) {
             std::memcpy(selectedPosRaw.data(), posRaw.data(), selectedPosRaw.size());
             return;
@@ -785,11 +1614,14 @@ int runTrain(int argc, char** argv) {
     const int miningMaxImageW = std::max(2048, maxImageW);
     const int miningMaxImageH = std::max(2048, maxImageH);
 
-    // Tile size controls memory footprint and kernel launch count.
+    // featureTile 是一个典型的吞吐量/显存折中参数：
+    // tile 太大，占显存多；tile 太小，kernel 启动次数太多。
     const int featureTile = 1024;
 
-    // Split training and inference engines to avoid allocating training buffers
-    // at demo-image resolution for all samples (huge VRAM waste).
+    // 训练和检测用两个 engine 分开建：
+    // 训练 engine 关心“很多个 24x24 patch”；
+    // mining/detect engine 关心“单张大图做多尺度检测”。
+    // 分开后可以避免把训练缓冲区错误地按大图尺寸放大，节省很多显存。
     FaceVisionEngine trainEngine(win, nSamples, win.winW, win.winH, false, 1);
     FaceVisionEngine detectEngine(win, 1, miningMaxImageW, miningMaxImageH, false, maxDetections);
     AdaBoostTrainer trainer(win, nSamples, featureTile);
@@ -891,6 +1723,7 @@ int runTrain(int argc, char** argv) {
     const dim3 grd(static_cast<unsigned>((nSamples + 255) / 256), 1, 1);
 
     auto normalizeWeights = [&]() -> bool {
+        // 每次更新权重前先把 inactive 样本清零，再做总和归一化。
         ApplyActiveMaskToWeightsKernel<<<grd, blk>>>(dWeight.data(), dActive.data(), nSamples);
         if (cudaGetLastError() != cudaSuccess) {
             return false;
@@ -907,6 +1740,8 @@ int runTrain(int argc, char** argv) {
     };
 
     auto resetStageWeights = [&](int activeNegCount) -> bool {
+        // 新 stage 开始时重置权重，不延续上一 stage 的样本权重分布。
+        // 这是级联训练中常见做法：每一层关注“当前还没被拒掉的负样本”。
         if (activeNegCount <= 0) {
             return false;
         }
@@ -928,6 +1763,7 @@ int runTrain(int argc, char** argv) {
               << " totalFeatureBudget=" << kPaperTotalFeatures << "\n";
 
     for (int stageIdx = 0; stageIdx < maxStages; ++stageIdx) {
+        // 外层循环训练 cascade 的 stage。
         if (static_cast<int>(selectedWeaks.size()) >= kPaperTotalFeatures) {
             std::cout << "[TRAIN] Reached total feature budget " << kPaperTotalFeatures
                       << ", stop at stage " << stageIdx << "\n";
@@ -941,6 +1777,7 @@ int runTrain(int argc, char** argv) {
         int stageNegCount = 0;
 
         if (stageIdx == 0) {
+            // 第 0 stage 还没有已有 cascade 可用，所以直接从缓存里采负样本。
             std::string stageNegBin;
             if (!regenerateStageNegativesFromCache(stageNegScriptPath,
                                                    stageNegCacheDir,
@@ -968,6 +1805,7 @@ int runTrain(int argc, char** argv) {
         }
 
         if (stageIdx > 0 && !stages.empty()) {
+            // 从第 1 stage 开始，用当前已经训练出来的 cascade 去大图里挖 hard negatives。
             std::vector<GpuStump4> hCurStumps(selectedWeaks.size());
             for (size_t wi = 0; wi < selectedWeaks.size(); ++wi) {
                 const WeakClassifier& w = selectedWeaks[wi];
@@ -1028,6 +1866,7 @@ int runTrain(int argc, char** argv) {
                                                    false);
                 if (st != Status::kOk) continue;
                 if (!mineDetections.empty()) {
+                    // 每张图只保留得分最高的一小部分框，防止某几张图淹没整个负样本池。
                     const int keepN = std::min(static_cast<int>(mineDetections.size()), perImageKeep);
                     std::partial_sort(mineDetections.begin(),
                                       mineDetections.begin() + keepN,
@@ -1059,6 +1898,7 @@ int runTrain(int argc, char** argv) {
         }
 
         if (hardSelected < numNeg) {
+            // 如果 hard negative 不够，就从缓存里补随机负样本，保证 stage 样本数固定。
             std::string stageNegBin;
             const int fallbackCount = std::max(numNeg, (numNeg - hardSelected) * hardNegCandidateMultiplier);
             if (!regenerateStageNegativesFromCache(stageNegScriptPath,
@@ -1088,6 +1928,7 @@ int runTrain(int argc, char** argv) {
             }
         }
 
+        // 当前 stage 的训练集 = 重新采样的 positives + 当前 stage 的 negatives。
         std::memcpy(trainRaw.data(), selectedPosRaw.data(), selectedPosRaw.size());
         std::memcpy(trainRaw.data() + selectedPosRaw.size(), selectedNegRaw.data(), selectedNegRaw.size());
         std::fill(hActive.begin(), hActive.end(), 1);
@@ -1162,6 +2003,7 @@ int runTrain(int argc, char** argv) {
         }
 
         for (int weakRound = 0; weakRound < stageWeakLimit; ++weakRound) {
+            // 内层循环训练一个 stage 中的若干个弱分类器。
             float bestErr = std::numeric_limits<float>::infinity();
             float bestTheta = 0.0f;
             int bestParity = +1;
@@ -1169,6 +2011,7 @@ int runTrain(int argc, char** argv) {
 
             int tileIdx = 0;
             for (int begin = 0; begin < numFeatures; begin += featureTile) {
+                // 分 tile 扫特征池，避免一次性为全部特征分配超大响应矩阵。
                 const int count = std::min(featureTile, numFeatures - begin);
 
                 st = trainer.evaluateFeatureResponses(trainEngine.deviceFeaturePool(), begin, count);
@@ -1236,6 +2079,7 @@ int runTrain(int argc, char** argv) {
                 return 1;
             }
 
+            // 把误差裁到 (0,1) 内，防止 log((1-err)/err) 数值爆炸。
             const float eps = 1e-6f;
             const float errClamped = std::min(std::max(bestErr, eps), 1.0f - eps);
             const float coeffC = std::log((1.0f - errClamped) / errClamped);
@@ -1321,9 +2165,10 @@ int runTrain(int argc, char** argv) {
                 return 1;
             }
 
-            // GPU-side threshold calibration:
-            // 1) sort positive strong scores, take cut value.
-            // 2) count pass/neg-survive for both >=cut and >cut in one kernel.
+            // stage 阈值校准：
+            // 1) 先对正样本 strong score 排序；
+            // 2) 取能满足 minHitRate 的 cut；
+            // 3) 再统计该 cut 下剩余负样本比例，判断 false alarm 是否达标。
             const int cutIdx = numPos - std::max(1, static_cast<int>(std::ceil(minHitRate * static_cast<float>(numPos))));
             const dim3 posGrid(static_cast<unsigned>((numPos + 255) / 256), 1, 1);
             ExtractPosScoresKernel<<<posGrid, blk>>>(dStrong.data(), dPosScoreIn.data(), numPos);
@@ -1370,6 +2215,7 @@ int runTrain(int argc, char** argv) {
             }
 
             const int minPass = std::max(1, static_cast<int>(std::ceil(minHitRate * static_cast<float>(numPos))));
+            // 同时比较 >=cut 和 >cut，选一个既尽量满足 hit rate 又更稳定的阈值口径。
             const bool strictGt = static_cast<int>(hRoundCounts[1]) >= minPass;
             stageThreshold = strictGt ? std::nextafter(hCutVal, std::numeric_limits<float>::infinity()) : hCutVal;
             const int posPass = strictGt ? static_cast<int>(hRoundCounts[1]) : static_cast<int>(hRoundCounts[0]);
@@ -1459,7 +2305,7 @@ int runTrain(int argc, char** argv) {
             break;
         }
 
-        // Apply stage rejection on GPU once after stage threshold is finalized.
+        // stage 训练完成后，再统一应用本 stage 的拒绝规则，更新剩余活跃负样本。
         UpdateActiveNegByThresholdKernel<<<grd, blk>>>(dStrong.data(),
                                                        dActive.data(),
                                                        nSamples,
@@ -1497,7 +2343,7 @@ int runTrain(int argc, char** argv) {
         CascadeStage cs{};
         cs.first = stageFirst;
         cs.ntrees = stageTrees;
-        // Align with OpenCV load-time behavior: stage threshold uses a tiny negative epsilon.
+        // 这里减一个极小 epsilon，是为了尽量贴近 OpenCV 在模型阈值比较上的边界行为。
         cs.threshold = stageThreshold - 1e-5f;
         stages.push_back(cs);
 
@@ -1525,6 +2371,7 @@ int runTrain(int argc, char** argv) {
         return 1;
     }
 
+    // 保存模型前，把 host 侧 WeakClassifier 打包成 GPU 检测时使用的紧凑格式。
     std::vector<GpuStump4> hStumps(selectedWeaks.size());
     for (size_t i = 0; i < selectedWeaks.size(); ++i) {
         const WeakClassifier& w = selectedWeaks[i];
@@ -1545,6 +2392,13 @@ int runTrain(int argc, char** argv) {
 }
 
 int runDetect(int argc, char** argv) {
+    // 正式检测入口：加载模型 -> 上传 GPU -> 运行 detectMultiScale -> 输出画框图。
+    //
+    // 输入:
+    //   命令行参数给出模型文件、输入图像和检测配置。
+    //
+    // 输出:
+    //   保存带框的结果图；若 benchmarkRuns>0，还会打印平均耗时和 FPS。
     if (argc < 4) {
         std::cerr << "Usage: cuda_hello detect <in_model.bin> <image.pgm> <out.ppm>"
                   << " [scaleFactor=1.25] [minNeighbors=4] [minObjectSize=24] [maxDetections=200000] [benchmarkRuns=0]\n";
@@ -1615,6 +2469,7 @@ int runDetect(int argc, char** argv) {
 
     std::vector<Detection> detections;
     if (benchmarkRuns > 0) {
+        // benchmark 模式会先 warmup，减少第一次调用的 lazy init 干扰。
         for (int i = 0; i < 3; ++i) {
             st = detectEngine.detectMultiScale(dImage.data(),
                                                img.w,
@@ -1724,9 +2579,18 @@ int runDetect(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
+    // 这里用最直接的字符串分发，不引入复杂命令行框架，便于课程项目演示和调试。
+    //
+    // 输入:
+    //   argv[1] 指定模式: train / detect / train_compare / detect_compare。
+    //
+    // 输出:
+    //   分发到对应入口函数。
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " train ... <out_model.bin>\n";
         std::cerr << "   or: " << argv[0] << " detect <in_model.bin> <image.pgm> <out.ppm>\n";
+        std::cerr << "   or: " << argv[0] << " train_compare <faces_u8.bin> <negatives_u8.bin> ...\n";
+        std::cerr << "   or: " << argv[0] << " detect_compare <in_model.bin> <image.pgm> <out.ppm> ...\n";
         return 1;
     }
     const std::string mode = argv[1];
@@ -1736,8 +2600,16 @@ int main(int argc, char** argv) {
     if (mode == "detect") {
         return runDetect(argc - 1, argv + 1);
     }
+    if (mode == "train_compare") {
+        return runTrainCompare(argc - 1, argv + 1);
+    }
+    if (mode == "detect_compare") {
+        return runDetectCompare(argc - 1, argv + 1);
+    }
     std::cerr << "[ERR] Unknown mode: " << mode << "\n";
     std::cerr << "Usage: " << argv[0] << " train ... <out_model.bin>\n";
     std::cerr << "   or: " << argv[0] << " detect <in_model.bin> <image.pgm> <out.ppm>\n";
+    std::cerr << "   or: " << argv[0] << " train_compare <faces_u8.bin> <negatives_u8.bin> ...\n";
+    std::cerr << "   or: " << argv[0] << " detect_compare <in_model.bin> <image.pgm> <out.ppm> ...\n";
     return 1;
 }
