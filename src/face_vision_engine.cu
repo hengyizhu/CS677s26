@@ -31,16 +31,6 @@ inline int divUpHost(int a, int b) {
     return (a + b - 1) / b;
 }
 
-template <typename T>
-__device__ __forceinline__ T ldgRead(const T* p) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 350)
-    // 对只读数据尽量走只读缓存路径，减轻普通 global memory load 压力。
-    return __ldg(p);
-#else
-    return *p;
-#endif
-}
-
 // 输入:
 //   d_gray: 原始灰度图批次，布局近似为 [sample][row][col]。
 //   imageW / imageH / imageStride: 单张图尺寸。
@@ -481,10 +471,10 @@ __global__ __launch_bounds__(256, 2) void DetectCascadeKernel(const int32_t* __r
     const int np2 = nx + iiWidth * (ny + nh);
     const int np3 = (nx + nw) + iiWidth * (ny + nh);
 
-    const auto readII = [&](int p) -> float { return static_cast<float>(ldgRead(d_sumT + p)); };
+    const auto readII = [&](int p) -> float { return static_cast<float>(*(d_sumT + p)); };
     const auto readSqU32 = [&](int p) -> uint32_t {
         // Match OpenCV setWindow(): sqsum delta is interpreted as unsigned 32-bit.
-        return static_cast<uint32_t>(ldgRead(d_sqsumT + p));
+        return static_cast<uint32_t>(*(d_sqsumT + p));
     };
 
     bool pass = false;
@@ -510,34 +500,34 @@ __global__ __launch_bounds__(256, 2) void DetectCascadeKernel(const int32_t* __r
                     for (int wi = 0; wi < st.ntrees; ++wi) {
                         // 一个 stump 被压成 float4：
                         // x 存 featureIdx 的 bit 表示，y 是 theta，z/w 是左右叶子分数。
-                        const float4 s = ldgRead(&(d_stumps[st.first + wi].st));
+                        const float4 s = d_stumps[st.first + wi].st;
                         const int featureIdx = __float_as_int(s.x);
                         const float theta = s.y;
                         const float leftVal = s.z;
                         const float rightVal = s.w;
 
-                        const int r0p0 = ldgRead(dR0Dy0 + featureIdx) * iiWidth + ldgRead(dR0Dx0 + featureIdx);
-                        const int r0p1 = ldgRead(dR0Dy1 + featureIdx) * iiWidth + ldgRead(dR0Dx1 + featureIdx);
-                        const int r0p2 = ldgRead(dR0Dy2 + featureIdx) * iiWidth + ldgRead(dR0Dx2 + featureIdx);
-                        const int r0p3 = ldgRead(dR0Dy3 + featureIdx) * iiWidth + ldgRead(dR0Dx3 + featureIdx);
-                        const int r1p0 = ldgRead(dR1Dy0 + featureIdx) * iiWidth + ldgRead(dR1Dx0 + featureIdx);
-                        const int r1p1 = ldgRead(dR1Dy1 + featureIdx) * iiWidth + ldgRead(dR1Dx1 + featureIdx);
-                        const int r1p2 = ldgRead(dR1Dy2 + featureIdx) * iiWidth + ldgRead(dR1Dx2 + featureIdx);
-                        const int r1p3 = ldgRead(dR1Dy3 + featureIdx) * iiWidth + ldgRead(dR1Dx3 + featureIdx);
+                        const int r0p0 = *(dR0Dy0 + featureIdx) * iiWidth + *(dR0Dx0 + featureIdx);
+                        const int r0p1 = *(dR0Dy1 + featureIdx) * iiWidth + *(dR0Dx1 + featureIdx);
+                        const int r0p2 = *(dR0Dy2 + featureIdx) * iiWidth + *(dR0Dx2 + featureIdx);
+                        const int r0p3 = *(dR0Dy3 + featureIdx) * iiWidth + *(dR0Dx3 + featureIdx);
+                        const int r1p0 = *(dR1Dy0 + featureIdx) * iiWidth + *(dR1Dx0 + featureIdx);
+                        const int r1p1 = *(dR1Dy1 + featureIdx) * iiWidth + *(dR1Dx1 + featureIdx);
+                        const int r1p2 = *(dR1Dy2 + featureIdx) * iiWidth + *(dR1Dx2 + featureIdx);
+                        const int r1p3 = *(dR1Dy3 + featureIdx) * iiWidth + *(dR1Dx3 + featureIdx);
 
-                        const float r0w = ldgRead(dR0W + featureIdx);
-                        const float r1w = ldgRead(dR1W + featureIdx);
+                        const float r0w = *(dR0W + featureIdx);
+                        const float r1w = *(dR1W + featureIdx);
 
                         const float v0 = (readII(base + r0p0) - readII(base + r0p1) - readII(base + r0p2) + readII(base + r0p3)) * r0w;
                         const float v1 = (readII(base + r1p0) - readII(base + r1p1) - readII(base + r1p2) + readII(base + r1p3)) * r1w;
 
                         float raw = v0 + v1;
-                        if (ldgRead(dRectCount + featureIdx) == 3) {
-                            const int r2p0 = ldgRead(dR2Dy0 + featureIdx) * iiWidth + ldgRead(dR2Dx0 + featureIdx);
-                            const int r2p1 = ldgRead(dR2Dy1 + featureIdx) * iiWidth + ldgRead(dR2Dx1 + featureIdx);
-                            const int r2p2 = ldgRead(dR2Dy2 + featureIdx) * iiWidth + ldgRead(dR2Dx2 + featureIdx);
-                            const int r2p3 = ldgRead(dR2Dy3 + featureIdx) * iiWidth + ldgRead(dR2Dx3 + featureIdx);
-                            const float r2w = ldgRead(dR2W + featureIdx);
+                        if (*(dRectCount + featureIdx) == 3) {
+                            const int r2p0 = *(dR2Dy0 + featureIdx) * iiWidth + *(dR2Dx0 + featureIdx);
+                            const int r2p1 = *(dR2Dy1 + featureIdx) * iiWidth + *(dR2Dx1 + featureIdx);
+                            const int r2p2 = *(dR2Dy2 + featureIdx) * iiWidth + *(dR2Dx2 + featureIdx);
+                            const int r2p3 = *(dR2Dy3 + featureIdx) * iiWidth + *(dR2Dx3 + featureIdx);
+                            const float r2w = *(dR2W + featureIdx);
                             const float v2 = (readII(base + r2p0) - readII(base + r2p1) - readII(base + r2p2) + readII(base + r2p3)) * r2w;
                             raw += v2;
                         }

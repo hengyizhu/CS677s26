@@ -28,16 +28,6 @@ constexpr int kSortThreads = 256;
 // 浮点比较时留一点 epsilon，避免两个几乎相等的响应因为数值误差被误判成可分裂点。
 constexpr float kValueEps = 1e-7f;
 
-template <typename T>
-__device__ __forceinline__ T ldgRead(const T* p) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 350)
-    // 对只读数据尽量走只读缓存路径，降低普通 global load 的压力。
-    return __ldg(p);
-#else
-    return *p;
-#endif
-}
-
 struct LocalBest {
     // 当前线程/当前归约阶段看到的最优误差。
     float err;
@@ -253,7 +243,7 @@ __global__ __launch_bounds__(256, 2) void EvaluateFeatureResponsesKernel(const H
     // 每次读积分图时，所有线程访问同一个角点偏移 p，但 sample 不同，
     // 这正好匹配转置布局的连续内存模式。
     const auto loadSumT = [&](int p) -> float {
-        return static_cast<float>(ldgRead(d_sumT + static_cast<size_t>(p) * nSamples + sample));
+        return static_cast<float>(*(d_sumT + static_cast<size_t>(p) * nSamples + sample));
     };
 
     const float s0 = loadSumT(f.r0.p0) - loadSumT(f.r0.p1) - loadSumT(f.r0.p2) + loadSumT(f.r0.p3);
@@ -266,7 +256,7 @@ __global__ __launch_bounds__(256, 2) void EvaluateFeatureResponsesKernel(const H
     }
 
     // 训练时使用方差归一化，减轻亮度整体偏移对响应值的影响。
-    const float invNorm = d_invNorm ? ldgRead(d_invNorm + sample) : 1.0f;
+    const float invNorm = d_invNorm ? *(d_invNorm + sample) : 1.0f;
     d_respOut[static_cast<size_t>(featureLocal) * nSamples + sample] = resp * invNorm;
 }
 
